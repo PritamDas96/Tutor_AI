@@ -630,7 +630,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     with st.spinner("Scoring with RAGAS…"):
                         scores = evaluate(
                             dataset=ds,
-                            metrics=[Faithfulness(), AnswerRelevancy(), ContextPrecision()],
+                            metrics=[Faithfulness(), AnswerRelevancy()],
                             llm=judge,
                             show_progress=True,
                         )

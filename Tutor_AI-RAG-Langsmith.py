@@ -620,7 +620,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                         temperature=0.2,
                         top_p=0.9,
                     )
-                    lc_chat = ChatHuggingFace(client=endpoint)  # IMPORTANT: use keyword 'client'
+                    lc_chat = ChatHuggingFace(llm=endpoint)  # IMPORTANT: use keyword 'client'
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"Judge LLM init failed: {e}")

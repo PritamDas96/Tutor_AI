@@ -1,9 +1,9 @@
 # GenAI-Tutor – Intelligent Conversational Learning Assistant (Hugging Face Chat)
 # ------------------------------------------------------------------------------
-# Blueprint-aligned UI:
-# - Sidebar: ONLY two dropdowns (Learning Scenario, HF Model)
-# - Main: Scenario Overview (card) → Expander: Personalized Study Notes → Chatbot below
-# - Open-source LLMs via huggingface_hub.InferenceClient.chat_completion
+# UI to-spec:
+# - Sidebar: ONLY 2 dropdowns (Learning Scenario, HF Model)
+# - Main: Scenario Overview → Expander: Personalized Study Notes (with dropdowns + "Other") → Chat below
+# - Notes: include citations/links to authoritative resources (curated per scenario)
 #
 # Deploy on Streamlit Cloud:
 # 1) requirements.txt -> streamlit, huggingface_hub>=0.24
@@ -38,7 +38,7 @@ HF_MODELS = [
 GEN_DEFAULTS = dict(max_new_tokens=512, temperature=0.7, top_p=0.9)
 
 # ----------------------------
-# Gen-AI Learning Scenarios
+# Gen-AI Learning Scenarios (content + system prompt)
 # ----------------------------
 SCENARIOS: Dict[str, Dict[str, str]] = {
     "Prompt Engineering Basics": {
@@ -96,8 +96,41 @@ Provide small rubrics, self-check prompts, and refusal/clarification strategies.
 Keep it pragmatic and safe-by-default."""
     },
 }
-
 SCENARIO_NAMES = list(SCENARIOS.keys())
+
+# ----------------------------
+# Curated Authoritative Resources (used in notes + rendered below)
+# ----------------------------
+RESOURCES: Dict[str, List[Dict[str, str]]] = {
+    "Prompt Engineering Basics": [
+        {"title": "Anthropic Prompt Engineering Guide", "url": "https://docs.anthropic.com/claude/docs/prompt-engineering"},
+        {"title": "OpenAI Cookbook", "url": "https://cookbook.openai.com/"},
+        {"title": "Microsoft Prompt Engineering (Learn)", "url": "https://learn.microsoft.com/azure/ai-services/openai/concepts/prompt-engineering"},
+        {"title": "Google Prompting with Gemini", "url": "https://ai.google.dev/gemini-api/docs/prompting"},
+    ],
+    "Responsible & Secure GenAI at Work": [
+        {"title": "NIST AI Risk Management Framework", "url": "https://www.nist.gov/itl/ai-risk-management-framework"},
+        {"title": "OWASP Top 10 for LLM Applications", "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/"},
+        {"title": "UK ICO – Guidance on AI & Data Protection", "url": "https://ico.org.uk/for-organisations/ai/"},
+    ],
+    "Automating Everyday Tasks with GenAI": [
+        {"title": "OpenAI Cookbook – Patterns & Examples", "url": "https://cookbook.openai.com/"},
+        {"title": "LangChain Docs – Prompt Templates", "url": "https://python.langchain.com/docs/concepts/prompt_templates"},
+        {"title": "Google Prompting with Gemini", "url": "https://ai.google.dev/gemini-api/docs/prompting"},
+    ],
+    "Writing & Communication with GenAI": [
+        {"title": "PlainLanguage.gov – Federal Plain Language Guidelines", "url": "https://www.plainlanguage.gov/"},
+        {"title": "Nielsen Norman Group – Writing for the Web", "url": "https://www.nngroup.com/topic/writing-web/"},
+    ],
+    "Data Summarization & Analysis with GenAI": [
+        {"title": "Nielsen Norman Group – Summarization Guidance", "url": "https://www.nngroup.com/articles/summarization/"},
+        {"title": "Harvard Guide to Summarizing", "url": "https://writingcenter.fas.harvard.edu/pages/strategies-essay-writing"},
+    ],
+    "Evaluation & Guardrails Basics": [
+        {"title": "NIST AI RMF (Risk Management)", "url": "https://www.nist.gov/itl/ai-risk-management-framework"},
+        {"title": "OWASP Top 10 for LLM Applications", "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/"},
+    ],
+}
 
 # ----------------------------
 # Sidebar (ONLY two dropdowns)
@@ -106,7 +139,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
-    # Token strictly comes from Secrets or env (no extra UI)
+    # Token strictly from Secrets or env
     hf_token = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
     st.caption("HF token is loaded from Secrets / env.")
 
@@ -142,7 +175,7 @@ if not st.session_state.messages or st.session_state.scenario_prev != scenario_n
     st.session_state.scenario_prev = scenario_name
 
 # ----------------------------
-# HF Call (chat-completion) with robust fallback provider
+# HF Call (chat-completion) with provider fallback
 # ----------------------------
 def call_hf_chat(model: str,
                  messages: List[Dict[str, str]],
@@ -153,7 +186,6 @@ def call_hf_chat(model: str,
     """
     Try default routing first; if provider-task issues occur, fall back to provider='hf-inference'.
     """
-    # Attempt 1: auto provider
     for provider in (None, "hf-inference"):
         try:
             client = InferenceClient(model=model, token=token, provider=provider)
@@ -185,24 +217,102 @@ with st.container():
     )
 
 # ----------------------------
-# Personalized Study Notes (Expander)
+# Personalized Study Notes (Expander with dropdowns + "Other")
 # ----------------------------
 st.markdown("---")
 with st.expander("📝 Personalized Study Notes", expanded=False):
+
+    # ---- Dropdown options ----
+    ROLE_OPTIONS = [
+        "General", "Manager", "Analyst", "Engineer/Developer", "HR/People",
+        "Sales", "Marketing", "Operations", "Finance", "Customer Support",
+        "Legal/Compliance", "Data/Analytics", "Other"
+    ]
+    TEAM_OPTIONS = [
+        "General", "HR", "Finance", "Marketing", "Sales", "IT/Engineering",
+        "Operations", "Legal/Compliance", "Customer Support", "Data/Analytics", "Other"
+    ]
+    GOAL_OPTIONS = [
+        "Use Gen-AI safely & responsibly",
+        "Write effective prompts",
+        "Automate routine tasks",
+        "Improve business writing",
+        "Summarize long content",
+        "Analyze/compare information",
+        "Build evaluation & guardrails",
+        "Other (type below)",
+    ]
+    PAIN_OPTIONS = [
+        "Unclear prompt structure",
+        "Fear of data leaks",
+        "Hallucinations/accuracy issues",
+        "Hard to control tone/style",
+        "Information overload",
+        "Tool overwhelm / where to start",
+        "Other (type below)",
+    ]
+
+    # ---- Compact layout ----
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
-        role = st.text_input("Your Role", value="People Operations Specialist")
+        role_choice = st.selectbox("Role", ROLE_OPTIONS, index=0)
+        role_other = ""
+        if role_choice == "Other":
+            role_other = st.text_input("Specify Role")
         level = st.selectbox("Current Level", ["Beginner", "Intermediate", "Advanced"], index=0)
+
     with col2:
+        team_choice = st.selectbox("Team / Domain", TEAM_OPTIONS, index=0)
+        team_other = ""
+        if team_choice == "Other":
+            team_other = st.text_input("Specify Team/Domain")
         time_per_day = st.text_input("Time Available / Day", value="15 minutes")
-        style = st.selectbox("Preferred Style", ["Concise & example-driven", "Step-by-step", "Visual & analogies"], index=0)
+
     with col3:
-        domain = st.text_input("Team/Domain", value="General")
-        _spacer = st.empty()
+        style = st.selectbox("Preferred Style", ["Concise & example-driven", "Step-by-step", "Visual & analogies"], index=0)
+        st.write("")  # spacer
 
-    goals = st.text_area("Your Top 3 Goals (comma-separated)", value="Use AI safely; Write effective prompts; Automate routine tasks")
-    pain = st.text_area("Pain Points / Confusions (optional)", value="Unsure how to structure prompts; Concerned about data security")
+    # Goals (multiselect with "Other")
+    goals_selected = st.multiselect("Your Top 3 Goals", options=GOAL_OPTIONS,
+                                    default=["Use Gen-AI safely & responsibly", "Write effective prompts", "Automate routine tasks"])
+    goals_other_text = ""
+    if "Other (type below)" in goals_selected:
+        goals_other_text = st.text_input("Other goals (comma-separated)")
 
+    # Pain points (multiselect with "Other")
+    pain_selected = st.multiselect("Pain Points / Confusions", options=PAIN_OPTIONS,
+                                   default=["Unclear prompt structure", "Fear of data leaks"])
+    pain_other_text = ""
+    if "Other (type below)" in pain_selected:
+        pain_other_text = st.text_input("Other pain points (comma-separated)")
+
+    # Enforce up to 3 goals
+    if len([g for g in goals_selected if g != "Other (type below)"]) > 3:
+        st.warning("Please select at most 3 preset goals (excluding 'Other'). Extra selections will be ignored.")
+
+    # Build final strings
+    def _finalize(value_choice: str, other: str) -> str:
+        return other.strip() if value_choice == "Other" and other.strip() else value_choice
+
+    role_val = _finalize(role_choice, role_other) or "General"
+    team_val = _finalize(team_choice, team_other) or "General"
+
+    def _merge_multiselect(base_list: List[str], other_text: str, max_keep: int = 3) -> str:
+        fixed = [x for x in base_list if x != "Other (type below)"]
+        fixed = fixed[:max_keep]  # cap
+        other_items = [x.strip() for x in other_text.split(",") if x.strip()] if other_text else []
+        merged = fixed + other_items
+        # de-duplicate while preserving order
+        seen, final = set(), []
+        for x in merged:
+            if x not in seen:
+                final.append(x); seen.add(x)
+        return ", ".join(final) if final else "(not provided)"
+
+    goals_val = _merge_multiselect(goals_selected, goals_other_text, max_keep=3)
+    pain_val = _merge_multiselect(pain_selected, pain_other_text, max_keep=5)
+
+    # Action buttons
     colA, colB, colC = st.columns([1, 1, 1])
     with colA:
         gen_notes = st.button("Generate Notes", use_container_width=True)
@@ -211,34 +321,44 @@ with st.expander("📝 Personalized Study Notes", expanded=False):
     with colC:
         clear_notes = st.button("Clear Notes", use_container_width=True, disabled=not bool(st.session_state.notes_text))
 
+    # Notes generation
     if gen_notes:
-        profile = {
-            "role": role, "level": level, "time": time_per_day, "style": style,
-            "domain": domain, "goals": goals, "pain": pain
-        }
-        # Build a small chat for notes generation (scenario-specific system + user request)
-        notes_messages = [
-            {"role": "system", "content": SCENARIOS[scenario_name]["system"]},
-            {"role": "user", "content": f"""
+        # Build system+user messages for notes; include authoritative resources IN the prompt
+        scenario_system = SCENARIOS[scenario_name]["system"]
+
+        # Prepare a list of curated links for the chosen scenario
+        curated = RESOURCES.get(scenario_name, [])
+        curated_bullets = "\n".join([f"- [{r['title']}]({r['url']})" for r in curated]) if curated else ""
+
+        user_request = f"""
 Create a concise, personalized study guide on **{scenario_name}** for the profile below.
 Keep it actionable with examples, mini-exercises, and quick checks. Prefer bullets/tables.
 
 Profile:
-- Role: {profile['role']}
-- Team/Domain: {profile['domain']}
-- Level: {profile['level']}
-- Goals: {profile['goals']}
-- Pain Points: {profile['pain']}
-- Preferred Style: {profile['style']}
-- Time per day: {profile['time']}
+- Role: {role_val}
+- Team/Domain: {team_val}
+- Level: {level}
+- Goals (top 3): {goals_val}
+- Pain Points: {pain_val}
+- Preferred Style: {style}
+- Time per day: {time_per_day}
 
 Include:
 1) Key Concepts (1–2 lines each)
-2) Practical Patterns / Templates
+2) Practical Patterns / Templates (aligned to the scenario)
 3) 3–5 Micro-exercises (with solutions or hints)
 4) Mini-Checklist (Do / Don’t)
 5) 5-day learning plan (15–20 min/day)
-"""}
+
+Important:
+- Add a **Sources** section at the end with **clickable markdown links**.
+- Use **at least 3** of these **authoritative resources** exactly as listed (no invented URLs):
+{curated_bullets if curated_bullets else "- (No curated links available)"}
+"""
+
+        notes_messages = [
+            {"role": "system", "content": scenario_system},
+            {"role": "user", "content": user_request},
         ]
         with st.spinner("Drafting your personalized study guide…"):
             try:
@@ -248,7 +368,7 @@ Include:
         st.session_state.notes_text = notes_text
 
     if insert_notes and st.session_state.notes_text:
-        # Insert notes into chat as additional system context
+        # Insert notes into chat as extra system context
         context_blob = f"Reference study notes for future answers (scenario: {scenario_name}):\n\n{st.session_state.notes_text}"
         st.session_state.messages.append({"role": "system", "content": context_blob})
         st.success("Notes inserted into chat context.")
@@ -257,10 +377,18 @@ Include:
         st.session_state.notes_text = ""
         st.info("Notes cleared.")
 
-    # Render notes (if any) and download button
+    # Render notes and a visible resource block (guaranteed accurate links)
     if st.session_state.notes_text:
         st.markdown("#### 📚 Your Study Guide")
         st.write(st.session_state.notes_text)
+
+        # Always render our curated resources below (even if model missed some)
+        curated = RESOURCES.get(scenario_name, [])
+        if curated:
+            st.markdown("#### 🔗 Authoritative Resources")
+            for r in curated:
+                st.markdown(f"- [{r['title']}]({r['url']})")
+
         st.download_button(
             label="Download as .md",
             data=st.session_state.notes_text.encode("utf-8"),
@@ -269,7 +397,7 @@ Include:
             use_container_width=True
         )
     else:
-        st.caption("Fill the profile and click **Generate Notes** to create your personalized study guide.")
+        st.caption("Select your role/team, pick goals and pain points, then click **Generate Notes**.")
 
 # ----------------------------
 # Chatbot (below the notes)
@@ -277,14 +405,14 @@ Include:
 st.markdown("---")
 st.subheader("💬 Tutor Chat")
 
-# Controls row: Reset Chat
+# Controls: Reset Chat
 cc1, cc2 = st.columns([1, 4])
 with cc1:
     if st.button("Reset Chat", use_container_width=True):
         _seed_chat()
         st.success("Chat reset.")
 
-# Show chat history
+# Render chat history
 for m in st.session_state.messages:
     if m["role"] == "assistant":
         with st.chat_message("assistant"):
@@ -293,7 +421,7 @@ for m in st.session_state.messages:
         with st.chat_message("user"):
             st.markdown(m["content"])
 
-# Chat input (send below notes)
+# Chat input
 user_prompt = st.chat_input("Ask anything about this Gen-AI learning scenario…")
 if user_prompt:
     st.session_state.messages.append({"role": "user", "content": user_prompt})

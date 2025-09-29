@@ -623,16 +623,15 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     lc_chat = ChatHuggingFace(llm=endpoint)  # IMPORTANT: use keyword 'client'
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
-                    st.error(f"Judge LLM init failed: {e}")
+                    st.error(f"HF judge failed: {e}")
                     judge = None
-
-                if judge:
-                    with st.spinner("Scoring with RAGAS…"):
-                        scores = evaluate(
-                            dataset=ds,
-                            metrics=[Faithfulness(), AnswerRelevancy()],
-                            llm=judge,
-                            show_progress=True,
+                if judge is None:
+                    st.stop() 
+                    scores = evaluate(
+                        dataset=ds,
+                        metrics=[Faithfulness(), AnswerRelevancy()],
+                        llm=judge,
+                        show_progress=True,
                         )
                     st.subheader("📈 RAGAS Results")
                     try:

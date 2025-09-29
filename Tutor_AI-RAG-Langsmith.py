@@ -1,9 +1,10 @@
 # GenAI-Tutor — RAG + LangSmith + RAGAS (Streamlit Cloud)
 # -------------------------------------------------------
-# Sidebar: ONLY two dropdowns (Learning Scenario, HF Model)
-# RAG: link-only ingestion → clean → chunk (~600 tokens, 80 overlap) → embed (bge-small)
-#      → FAISS (cosine via IP on normalized vecs) → rerank (bge-reranker) → top_k=7
-# Observability: LangSmith tracing of chat and retrieval; thumbs feedback; RAGAS eval panel.
+# - Sidebar: ONLY two dropdowns (Learning Scenario, HF Model)
+# - RAG: fetch → clean → chunk (~600 tokens, 80 overlap) → embed (bge-small)
+#        → FAISS (cosine via IP on normalized vecs) → rerank (bge-reranker) → top_k=7
+# - Observability: LangSmith tracing for chat & retrieval; thumbs feedback; RAGAS eval panel.
+# - RAG switch ON => minimal prompts & strict use of retrieved CONTEXT with inline [n] citations.
 
 import os
 import io
@@ -12,7 +13,7 @@ import json
 import hashlib
 import requests
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from huggingface_hub import InferenceClient
@@ -28,8 +29,9 @@ from langsmith.run_helpers import trace, tracing_context, get_current_run_tree
 from ragas import evaluate, EvaluationDataset
 from ragas.metrics import Faithfulness, AnswerRelevancy, ContextPrecision
 from ragas.llms import LangchainLLMWrapper
-from langchain_huggingface import ChatHuggingFace
-from langchain_huggingface.llms import HuggingFaceEndpoint
+
+# -------- LangChain (judge LLM wrapper for RAGAS) --------
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
 # ===========================
 # App Config & Secrets
@@ -37,12 +39,10 @@ from langchain_huggingface.llms import HuggingFaceEndpoint
 st.set_page_config(page_title="GenAI-Tutor (RAG + Observability)", layout="wide")
 st.markdown("<h1>🎓 GenAI-Tutor — Intelligent Conversational Learning Assistant</h1>", unsafe_allow_html=True)
 
-# HF + LangSmith secrets / env
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
     st.stop()
-
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
@@ -70,28 +70,28 @@ SCENARIOS: Dict[str, Dict[str, str]] = {
 - Patterns: few-shot, step-by-step, style/format guides
 - Practical templates for summaries, emails, brainstorming
 - Ways to reduce hallucinations (be specific, ask for sources)""",
-        "system": """You are GenAI-Tutor, an expert coach on prompt engineering for employees. Be concise, practical, and safe."""
+        "system": "You are GenAI-Tutor, an expert coach on prompt engineering for employees. Be concise, practical, and safe."
     },
     "Responsible & Secure GenAI at Work": {
         "overview": """- Safe inputs (no confidential/PII), data minimization
 - Policy-aligned usage, approvals
 - Phishing/social engineering risks
 - Checklists and red flags""",
-        "system": """You are GenAI-Tutor for responsible, secure GenAI usage at work. Teach practical, checklist-driven guidance."""
+        "system": "You are GenAI-Tutor for responsible, secure GenAI usage at work. Teach practical, checklist-driven guidance."
     },
     "Automating Everyday Tasks with GenAI": {
         "overview": """- Draft emails, notes, briefs, SOPs
 - Idea generation & prioritization
 - Notes → structured outputs (tables, action items)
 - Time-saving workflows""",
-        "system": """You are GenAI-Tutor for everyday task automation. Provide templates and quick workflows."""
+        "system": "You are GenAI-Tutor for everyday task automation. Provide templates and quick workflows."
     },
     "Writing & Communication with GenAI": {
         "overview": """- Tone targeting and audience fit
 - Rewrite/expand/condense with structure and clarity
 - Persuasive & empathetic patterns
 - Review checklists""",
-        "system": """You are GenAI-Tutor for business writing with Gen-AI. Focus on clarity, inclusivity, and concise structure."""
+        "system": "You are GenAI-Tutor for business writing with Gen-AI. Focus on clarity, inclusivity, and concise structure."
     },
 }
 SCENARIO_NAMES = list(SCENARIOS.keys())
@@ -118,7 +118,7 @@ if "notes_text" not in st.session_state:
 if "use_rag" not in st.session_state:
     st.session_state.use_rag = True
 if "turn_logs" not in st.session_state:
-    # For RAGAS: list of dicts per turn {'run_id', 'question', 'contexts':[...], 'answer'}
+    # For RAGAS: per-turn {'run_id','question','contexts':[...],'answer'}
     st.session_state.turn_logs: List[Dict[str, Any]] = []
 
 def _seed_chat():
@@ -167,7 +167,7 @@ K_CANDIDATES = 30
 WORDS_PER_CHUNK = 450     # ~600 tokens (rough)
 OVERLAP_WORDS = 80
 
-# 5 accessible sources
+# 5 accessible sources (public)
 DOC_LINKS = [
     {
         "title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
@@ -196,6 +196,7 @@ DOC_LINKS = [
     },
 ]
 
+# -------- Fetch & Clean --------
 @st.cache_data(show_spinner=False)
 def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
@@ -238,6 +239,7 @@ def fetch_and_clean(url: str) -> str:
         st.info(f"Skipping (fetch error): {url} ({e})")
         return ""
 
+# -------- Chunking --------
 def _to_words(text: str) -> List[str]:
     return [w for w in text.replace("\u00a0", " ").split() if w]
 
@@ -259,6 +261,7 @@ def chunk_text(text: str, url: str, title: str,
         k += 1
     return chunks
 
+# -------- Embeddings & Reranker --------
 @st.cache_resource(show_spinner=True)
 def load_embedder() -> SentenceTransformer:
     return SentenceTransformer("BAAI/bge-small-en-v1.5")
@@ -271,14 +274,16 @@ def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
     X = model.encode(texts, batch_size=64, normalize_embeddings=True, convert_to_numpy=True)
     return X.astype("float32")
 
+# -------- FAISS Index --------
 @st.cache_resource(show_spinner=True)
 def build_faiss(vectors: np.ndarray):
-    import faiss
+    import faiss  # lazy import
     d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)  # cosine via IP on normalized
+    index = faiss.IndexFlatIP(d)  # cosine via IP on normalized vecs
     index.add(vectors)
     return index
 
+# -------- Build RAG index --------
 @st.cache_resource(show_spinner=True)
 def build_rag_index(doc_links: List[Dict[str, Any]]):
     embedder = load_embedder()
@@ -301,13 +306,14 @@ def refresh_rag_cache():
     st.cache_resource.clear()
     st.cache_data.clear()
 
+# -------- Retrieve → Rerank → top_k --------
 @traceable(run_type="retriever", name="retrieve", metadata={"top_k": TOP_K})
 def retrieve(query: str,
              index,
              side: Dict[str, Any],
              top_k: int = TOP_K,
              k_candidates: int = K_CANDIDATES) -> List[Dict[str, Any]]:
-    import faiss
+    import faiss  # noqa
     embedder = load_embedder()
     reranker = load_reranker()
 
@@ -317,7 +323,7 @@ def retrieve(query: str,
 
     candidates = []
     for pos, (ci, s) in enumerate(zip(cand_ids, cand_scores)):
-        if ci < 0: 
+        if ci < 0:
             continue
         c = side["chunks"][ci]
         candidates.append({"rank_ann": pos + 1, "score_ann": float(s), **c})
@@ -388,12 +394,6 @@ with st.expander("📝 Personalized Study Notes (RAG-aware)", expanded=False):
         style = st.selectbox("Preferred Style", ["Concise & example-driven","Step-by-step","Visual & analogies"], index=0)
         st.write("")
 
-    goals_sel = st.multiselect("Your Top 3 Goals", GOAL_OPTS,
-                               default=["Use Gen-AI safely & responsibly","Write effective prompts","Automate routine tasks"])
-    goals_other = st.text_input("Other goals (comma-separated)") if "Other (type below)" in goals_sel else ""
-    pains_sel = st.multiselect("Pain Points", PAIN_OPTS, default=["Unclear prompt structure","Fear of data leaks"])
-    pains_other = st.text_input("Other pain points (comma-separated)") if "Other (type below)" in pains_sel else ""
-
     def _finalize(choice, other): return other.strip() if (choice=="Other" and other.strip()) else choice
     role_val = _finalize(role_choice, role_other) or "General"
     team_val = _finalize(team_choice, team_other) or "General"
@@ -406,6 +406,12 @@ with st.expander("📝 Personalized Study Notes (RAG-aware)", expanded=False):
             if x not in seen:
                 out.append(x); seen.add(x)
         return ", ".join(out) if out else "(not provided)"
+
+    goals_sel = st.multiselect("Your Top 3 Goals", GOAL_OPTS,
+                               default=["Use Gen-AI safely & responsibly","Write effective prompts","Automate routine tasks"])
+    goals_other = st.text_input("Other goals (comma-separated)") if "Other (type below)" in goals_sel else ""
+    pains_sel = st.multiselect("Pain Points", PAIN_OPTS, default=["Unclear prompt structure","Fear of data leaks"])
+    pains_other = st.text_input("Other pain points (comma-separated)") if "Other (type below)" in pains_sel else ""
 
     goals_val = _merge(goals_sel, goals_other, 3)
     pains_val = _merge(pains_sel, pains_other, 5)
@@ -452,7 +458,7 @@ with st.expander("📝 Personalized Study Notes (RAG-aware)", expanded=False):
                                 except Exception as e:
                                     st.session_state.notes_text = f"⚠️ Error while generating notes: {e}"
                 else:
-                    # Non-RAG fallback
+                    # Non-RAG fallback (kept minimal)
                     messages = [
                         {"role": "system", "content": SCENARIOS[scenario_name]["system"]},
                         {"role": "user", "content":
@@ -518,7 +524,6 @@ user_prompt = st.chat_input("Ask anything about this Gen-AI learning scenario…
 if user_prompt:
     st.session_state.messages.append({"role": "user", "content": user_prompt})
 
-    # Root trace (chat turn)
     with tracing_context(project_name=LS_PROJECT, metadata={"type": "chat_turn", "scenario": scenario_name, "use_rag": st.session_state.use_rag, "model": model_id}):
         with trace("chat_turn", run_type="chain", inputs={"question": user_prompt}) as root:
             messages_for_call = list(st.session_state.messages)
@@ -536,7 +541,6 @@ if user_prompt:
                             *messages_for_call[1:]
                         ]
 
-            # Call LLM
             with st.chat_message("assistant"):
                 try:
                     reply = call_hf_chat(model_id, messages_for_call, HF_TOKEN)
@@ -570,8 +574,6 @@ if user_prompt:
                             st.info("Feedback logging failed (check LangSmith key).")
 
             st.session_state.messages.append({"role": "assistant", "content": reply})
-
-            # Keep a local per-turn log for RAGAS (and also store run_id)
             try:
                 rid = str(get_current_run_tree().id)
             except Exception:
@@ -588,8 +590,9 @@ if user_prompt:
 # ===========================
 st.markdown("---")
 with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
-    st.write("Runs **faithfulness**, **answer relevancy**, and **context precision** on the last N chats in this session. Optionally logs aggregate metrics back to LangSmith as feedback on the latest run.")
-    N = st.slider("How many recent chats to evaluate?", min_value=1, max_value=50, value=min(10, len(st.session_state.turn_logs)) if st.session_state.turn_logs else 5)
+    st.write("Runs **faithfulness**, **answer relevancy**, and **context precision** on the last N chats of this session. Optionally logs aggregate metrics to LangSmith on the latest run.")
+    N = st.slider("How many recent chats to evaluate?", min_value=1, max_value=50,
+                  value=min(10, len(st.session_state.turn_logs)) if st.session_state.turn_logs else 5)
     if st.button("Run RAGAS now"):
         turns = st.session_state.turn_logs[-N:] if st.session_state.turn_logs else []
         if not turns:
@@ -597,28 +600,28 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
         else:
             data = []
             for t in turns:
-                if not (t["question"] and t["answer"] and t["contexts"]):
-                    # Skip turns without RAG contexts
-                    continue
-                data.append({
-                    "user_input": t["question"],
-                    "retrieved_contexts": t["contexts"],
-                    "response": t["answer"],
-                })
+                if t["question"] and t["answer"] and t["contexts"]:
+                    data.append({
+                        "user_input": t["question"],
+                        "retrieved_contexts": t["contexts"],
+                        "response": t["answer"],
+                    })
             if not data:
                 st.warning("No evaluable turns (need RAG contexts).")
             else:
                 ds = EvaluationDataset.from_list(data)
-
-                # Use an OSS HF endpoint as judge (you can swap to OpenAI if you prefer)
+                # Judge LLM via LangChain → HF Inference; wrap for RAGAS
                 try:
-                    llm = HuggingFaceEndpoint(
-                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
+                    endpoint = HuggingFaceEndpoint(
+                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",   # choose any chat-capable model you have access to
                         task="text-generation",
                         huggingfacehub_api_token=os.environ["HUGGINGFACEHUB_API_TOKEN"],
-                        max_new_tokens=256, temperature=0.2, top_p=0.9,
+                        max_new_tokens=256,
+                        temperature=0.2,
+                        top_p=0.9,
                     )
-                    judge = LangchainLLMWrapper(ChatHuggingFace(llm))
+                    lc_chat = ChatHuggingFace(client=endpoint)  # IMPORTANT: use keyword 'client'
+                    judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"Judge LLM init failed: {e}")
                     judge = None
@@ -633,38 +636,21 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                         )
                     st.subheader("📈 RAGAS Results")
                     try:
-                        # scores is typically a Dataset with overall dict as well
                         st.write(scores)
                     except Exception:
                         st.json(scores)
 
-                    # Optionally push aggregate metrics back to LangSmith as feedback on the last run
-                    if st.button("Log aggregate metrics to LangSmith (latest run)"):
+                    # Optional: push placeholder metrics to LangSmith (aggregate logging)
+                    if st.button("Log aggregate metric placeholders to LangSmith (latest run)"):
                         try:
                             latest_run_id = turns[-1]["run_id"] or None
                             if not latest_run_id:
                                 st.info("No run_id to attach feedback.")
                             else:
-                                # Best-effort parse for aggregates
-                                # If 'scores' provides .overall, use it; otherwise skip logging
-                                agg = {}
-                                try:
-                                    # RAGAS newer versions often provide dict-like results:
-                                    # e.g., scores['faithfulness']['score'] etc.
-                                    # We'll try a few fallbacks safely.
-                                    text_scores = str(scores)
-                                    # naive parse for demo (you can refine to exact schema if needed)
-                                    agg["faithfulness"] = None
-                                    agg["answer_relevancy"] = None
-                                    agg["context_precision"] = None
-                                except Exception:
-                                    pass
-
-                                # Log placeholders or parsed values
-                                for k, v in agg.items():
-                                    if v is not None:
-                                        ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=float(v))
-                                st.success("(Demo) Logged RAGAS feedback keys to LangSmith (values may be None if parsing failed).")
+                                # You can parse 'scores' to extract real aggregates; here we write placeholders safely.
+                                for k in ["faithfulness", "answer_relevancy", "context_precision"]:
+                                    ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
+                                st.success("Logged placeholder RAGAS keys to LangSmith (customize parsing as needed).")
                         except Exception as e:
                             st.info(f"Feedback logging failed: {e}")
 

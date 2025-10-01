@@ -1,10 +1,6 @@
 # GenAI-Tutor — RAG + LangSmith + RAGAS (Streamlit Cloud)
 # -------------------------------------------------------
-# - Sidebar: ONLY two dropdowns (Learning Scenario, HF Model)
-# - RAG: fetch → clean → chunk (~600 tokens, 80 overlap) → embed (bge-small)
-#        → FAISS (cosine via IP on normalized vecs) → rerank (bge-reranker) → top_k=7
-# - Observability: LangSmith tracing for chat & retrieval; thumbs feedback; RAGAS eval panel.
-# - RAG switch ON => minimal prompts & strict use of retrieved CONTEXT with inline [n] citations.
+# - HF only (no OpenAI). RAGAS gets HF LLM + HF embeddings to avoid any OpenAI fallback.
 
 import os
 import io
@@ -29,6 +25,7 @@ from langsmith.run_helpers import trace, tracing_context, get_current_run_tree
 from ragas import evaluate, EvaluationDataset
 from ragas.metrics import Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import HuggingfaceEmbeddings   # <-- NEW: HF embeddings for RAGAS
 
 # -------- LangChain (judge LLM wrapper for RAGAS) --------
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
@@ -43,7 +40,6 @@ HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
     st.stop()
-# Make sure the HF endpoint sees the token
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
@@ -119,7 +115,6 @@ if "notes_text" not in st.session_state:
 if "use_rag" not in st.session_state:
     st.session_state.use_rag = True
 if "turn_logs" not in st.session_state:
-    # For RAGAS: per-turn {'run_id','question','contexts':[...],'answer'}
     st.session_state.turn_logs: List[Dict[str, Any]] = []
 
 def _seed_chat():
@@ -165,39 +160,22 @@ def call_hf_chat(model: str,
 # ============================================================
 TOP_K = 7
 K_CANDIDATES = 30
-WORDS_PER_CHUNK = 450     # ~600 tokens (rough)
+WORDS_PER_CHUNK = 450
 OVERLAP_WORDS = 80
 
-# 5 accessible sources (public)
 DOC_LINKS = [
-    {
-        "title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
-        "url": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2025.1565938/full",
-        "enabled": True
-    },
-    {
-        "title": "Learn Your Way: Reimagining Textbooks with Generative AI (2025) — Google",
-        "url": "https://blog.google/outreach-initiatives/education/learn-your-way/",
-        "enabled": True
-    },
-    {
-        "title": "Student Generative AI Survey 2025 — HEPI",
-        "url": "https://www.hepi.ac.uk/reports/student-generative-ai-survey-2025/",
-        "enabled": True
-    },
-    {
-        "title": "Educational impacts of generative AI on learning & performance (2025) — Nature (PDF)",
-        "url": "https://www.nature.com/articles/s41598-025-06930-w.pdf",
-        "enabled": True
-    },
-    {
-        "title": "Enhancing Retrieval-Augmented Generation: Best Practices — COLING 2025 (PDF)",
-        "url": "https://aclanthology.org/2025.coling-main.449.pdf",
-        "enabled": True
-    },
+    {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
+     "url": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2025.1565938/full", "enabled": True},
+    {"title": "Learn Your Way: Reimagining Textbooks with Generative AI (2025) — Google",
+     "url": "https://blog.google/outreach-initiatives/education/learn-your-way/", "enabled": True},
+    {"title": "Student Generative AI Survey 2025 — HEPI",
+     "url": "https://www.hepi.ac.uk/reports/student-generative-ai-survey-2025/", "enabled": True},
+    {"title": "Educational impacts of generative AI on learning & performance (2025) — Nature (PDF)",
+     "url": "https://www.nature.com/articles/s41598-025-06930-w.pdf", "enabled": True},
+    {"title": "Enhancing Retrieval-Augmented Generation: Best Practices — COLING 2025 (PDF)",
+     "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
 ]
 
-# -------- Fetch & Clean --------
 @st.cache_data(show_spinner=False)
 def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
     r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
@@ -240,13 +218,11 @@ def fetch_and_clean(url: str) -> str:
         st.info(f"Skipping (fetch error): {url} ({e})")
         return ""
 
-# -------- Chunking --------
 def _to_words(text: str) -> List[str]:
     return [w for w in text.replace("\u00a0", " ").split() if w]
 
 def chunk_text(text: str, url: str, title: str,
-               target_words: int = WORDS_PER_CHUNK,
-               overlap_words: int = OVERLAP_WORDS) -> List[Dict[str, Any]]:
+               target_words: int = WORDS_PER_CHUNK, overlap_words: int = OVERLAP_WORDS) -> List[Dict[str, Any]]:
     if not text:
         return []
     words = _to_words(text)
@@ -256,13 +232,13 @@ def chunk_text(text: str, url: str, title: str,
         piece = " ".join(words[start:end])
         chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
         chunks.append({"chunk_id": chunk_id, "title": title, "url": url, "text": piece})
+    # advance window
         if end == len(words):
             break
         start = max(0, end - overlap_words)
         k += 1
     return chunks
 
-# -------- Embeddings & Reranker --------
 @st.cache_resource(show_spinner=True)
 def load_embedder() -> SentenceTransformer:
     return SentenceTransformer("BAAI/bge-small-en-v1.5")
@@ -275,16 +251,14 @@ def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
     X = model.encode(texts, batch_size=64, normalize_embeddings=True, convert_to_numpy=True)
     return X.astype("float32")
 
-# -------- FAISS Index --------
 @st.cache_resource(show_spinner=True)
 def build_faiss(vectors: np.ndarray):
-    import faiss  # lazy import
+    import faiss
     d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)  # cosine via IP on normalized vecs
+    index = faiss.IndexFlatIP(d)
     index.add(vectors)
     return index
 
-# -------- Build RAG index --------
 @st.cache_resource(show_spinner=True)
 def build_rag_index(doc_links: List[Dict[str, Any]]):
     embedder = load_embedder()
@@ -307,13 +281,9 @@ def refresh_rag_cache():
     st.cache_resource.clear()
     st.cache_data.clear()
 
-# -------- Retrieve → Rerank → top_k --------
 @traceable(run_type="retriever", name="retrieve", metadata={"top_k": TOP_K})
-def retrieve(query: str,
-             index,
-             side: Dict[str, Any],
-             top_k: int = TOP_K,
-             k_candidates: int = K_CANDIDATES) -> List[Dict[str, Any]]:
+def retrieve(query: str, index, side: Dict[str, Any],
+             top_k: int = TOP_K, k_candidates: int = K_CANDIDATES) -> List[Dict[str, Any]]:
     import faiss  # noqa
     embedder = load_embedder()
     reranker = load_reranker()
@@ -355,10 +325,9 @@ def build_context_and_citations(retrieved: List[Dict[str, Any]]) -> Tuple[str, s
     return "\n\n".join(blocks), "\n".join(refs), retrieved
 
 def rag_rules() -> str:
-    return ("Use ONLY the provided CONTEXT. "
-            "Cite like [1], [2] after claims tied to evidence. "
-            "If context is insufficient, say so and suggest which source to read. "
-            "Do NOT invent URLs. End with a 'Sources' list mapping [n] → URL.")
+    return ("Use ONLY the provided CONTEXT. Cite like [1], [2] after claims tied to evidence. "
+            "If context is insufficient, say so and suggest which source to read. Do NOT invent URLs. "
+            "End with a 'Sources' list mapping [n] → URL.")
 
 # ===========================
 # Overview
@@ -459,7 +428,6 @@ with st.expander("📝 Personalized Study Notes (RAG-aware)", expanded=False):
                                 except Exception as e:
                                     st.session_state.notes_text = f"⚠️ Error while generating notes: {e}"
                 else:
-                    # Non-RAG fallback (kept minimal)
                     messages = [
                         {"role": "system", "content": SCENARIOS[scenario_name]["system"]},
                         {"role": "user", "content":
@@ -516,7 +484,6 @@ with cc1:
         _seed_chat()
         st.success("Chat reset.")
 
-# render history
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
         st.markdown(m["content"])
@@ -537,7 +504,7 @@ if user_prompt:
                     if retrieved:
                         ctx, srcs, evidence_to_show = build_context_and_citations(retrieved)
                         messages_for_call = [
-                            messages_for_call[0],  # scenario system
+                            messages_for_call[0],
                             {"role":"system","content": f"CONTEXT:\n{ctx}\n\nSOURCES:\n{srcs}\n\n{rag_rules()}"},
                             *messages_for_call[1:]
                         ]
@@ -556,7 +523,6 @@ if user_prompt:
                             st.markdown(f"**[{i}] [{c['title']}]({c['url']})**")
                             st.write(preview)
 
-                # Thumbs feedback → LangSmith
                 with st.expander("Rate this answer"):
                     col1, col2 = st.columns(2)
                     if col1.button("👍 Helpful"):
@@ -611,21 +577,29 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                 st.warning("No evaluable turns (need RAG contexts).")
             else:
                 ds = EvaluationDataset.from_list(data)
-                # Judge LLM via LangChain → HF Inference; wrap for RAGAS
+
+                # --- HF Judge (LangChain) ---
                 try:
                     endpoint = HuggingFaceEndpoint(
-                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",  # choose any chat-capable model you have access to
+                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
                         task="text-generation",
                         huggingfacehub_api_token=os.environ["HUGGINGFACEHUB_API_TOKEN"],
                         max_new_tokens=256,
                         temperature=0.2,
                         top_p=0.9,
                     )
-                    lc_chat = ChatHuggingFace(llm=endpoint)  # pass endpoint as llm=
+                    lc_chat = ChatHuggingFace(llm=endpoint)
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"HF judge failed: {e}")
                     judge = None
+
+                # --- HF Embeddings for RAGAS (prevents OpenAI fallback) ---
+                @st.cache_resource(show_spinner=False)
+                def get_ragas_embeddings():
+                    # Use the same model family as retrieval for consistency
+                    return HuggingfaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+                hf_emb = get_ragas_embeddings()
 
                 if judge is None:
                     st.error("HF judge did not initialize. Check HF token / model access.")
@@ -634,8 +608,9 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     with st.spinner("Scoring with RAGAS…"):
                         scores = evaluate(
                             dataset=ds,
-                            metrics=[Faithfulness(), AnswerRelevancy()],  # reference-free metrics only
-                            llm=judge,                                     # <- ensures HF judge is used
+                            metrics=[Faithfulness(), AnswerRelevancy()],
+                            llm=judge,            # HF judge
+                            embeddings=hf_emb,    # HF embeddings -> no OpenAI
                             show_progress=True,
                         )
                     st.subheader("📈 RAGAS Results")
@@ -644,7 +619,6 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     except Exception:
                         st.json(scores)
 
-                    # Optional: push placeholder metrics to LangSmith (aggregate logging)
                     if st.button("Log aggregate metric placeholders to LangSmith (latest run)"):
                         try:
                             latest_run_id = turns[-1]["run_id"] or None
@@ -653,7 +627,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                             else:
                                 for k in ["faithfulness", "answer_relevancy"]:
                                     ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
-                                st.success("Logged placeholder RAGAS keys to LangSmith (customize parsing if you want real numbers).")
+                                st.success("Logged placeholder RAGAS keys to LangSmith (customize if needed).")
                         except Exception as e:
                             st.info(f"Feedback logging failed: {e}")
 

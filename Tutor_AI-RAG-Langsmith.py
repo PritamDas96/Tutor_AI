@@ -627,6 +627,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     judge = None
                 if judge is None:
                     st.stop() 
+                else:
                     scores = evaluate(
                         dataset=ds,
                         metrics=[Faithfulness(), AnswerRelevancy()],

@@ -1,6 +1,10 @@
 # GenAI-Tutor — RAG + LangSmith + RAGAS (Streamlit Cloud)
 # -------------------------------------------------------
-# - HF only (no OpenAI). RAGAS gets HF LLM + HF embeddings to avoid any OpenAI fallback.
+# - Sidebar: ONLY two dropdowns (Learning Scenario, HF Model)
+# - RAG: fetch → clean → chunk (~600 tokens, 80 overlap) → embed (bge-small)
+#        → FAISS (cosine via IP on normalized vecs) → rerank (bge-reranker) → top_k=7
+# - Observability: LangSmith tracing for chat & retrieval; thumbs feedback; RAGAS eval panel.
+# - RAG switch ON => minimal prompts & strict use of retrieved CONTEXT with inline [n] citations.
 
 import os
 import io
@@ -25,10 +29,11 @@ from langsmith.run_helpers import trace, tracing_context, get_current_run_tree
 from ragas import evaluate, EvaluationDataset
 from ragas.metrics import Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import HuggingfaceEmbeddings   # <-- NEW: HF embeddings for RAGAS
+from ragas.embeddings import LangchainEmbeddings  # <-- use LC wrapper
 
-# -------- LangChain (judge LLM wrapper for RAGAS) --------
+# -------- LangChain (judge LLM + embeddings for RAGAS) --------
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEmbeddings as LcHfEmbeddings  # <-- embeddings impl
 
 # ===========================
 # App Config & Secrets
@@ -40,6 +45,7 @@ HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
     st.stop()
+# Ensure downstream libs see the token
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
@@ -232,7 +238,6 @@ def chunk_text(text: str, url: str, title: str,
         piece = " ".join(words[start:end])
         chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
         chunks.append({"chunk_id": chunk_id, "title": title, "url": url, "text": piece})
-    # advance window
         if end == len(words):
             break
         start = max(0, end - overlap_words)
@@ -484,6 +489,7 @@ with cc1:
         _seed_chat()
         st.success("Chat reset.")
 
+# render history
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
         st.markdown(m["content"])
@@ -504,7 +510,7 @@ if user_prompt:
                     if retrieved:
                         ctx, srcs, evidence_to_show = build_context_and_citations(retrieved)
                         messages_for_call = [
-                            messages_for_call[0],
+                            messages_for_call[0],  # scenario system
                             {"role":"system","content": f"CONTEXT:\n{ctx}\n\nSOURCES:\n{srcs}\n\n{rag_rules()}"},
                             *messages_for_call[1:]
                         ]
@@ -523,6 +529,7 @@ if user_prompt:
                             st.markdown(f"**[{i}] [{c['title']}]({c['url']})**")
                             st.write(preview)
 
+                # Thumbs feedback → LangSmith
                 with st.expander("Rate this answer"):
                     col1, col2 = st.columns(2)
                     if col1.button("👍 Helpful"):
@@ -588,7 +595,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                         temperature=0.2,
                         top_p=0.9,
                     )
-                    lc_chat = ChatHuggingFace(llm=endpoint)
+                    lc_chat = ChatHuggingFace(llm=endpoint)   # pass endpoint as llm=
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"HF judge failed: {e}")
@@ -597,8 +604,8 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                 # --- HF Embeddings for RAGAS (prevents OpenAI fallback) ---
                 @st.cache_resource(show_spinner=False)
                 def get_ragas_embeddings():
-                    # Use the same model family as retrieval for consistency
-                    return HuggingfaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+                    lc_emb = LcHfEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+                    return LangchainEmbeddings(lc_emb)
                 hf_emb = get_ragas_embeddings()
 
                 if judge is None:
@@ -609,8 +616,8 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                         scores = evaluate(
                             dataset=ds,
                             metrics=[Faithfulness(), AnswerRelevancy()],
-                            llm=judge,            # HF judge
-                            embeddings=hf_emb,    # HF embeddings -> no OpenAI
+                            llm=judge,            # HF judge (no OpenAI)
+                            embeddings=hf_emb,    # HF embeddings (no OpenAI)
                             show_progress=True,
                         )
                     st.subheader("📈 RAGAS Results")
@@ -619,6 +626,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     except Exception:
                         st.json(scores)
 
+                    # Optional logging to LangSmith (placeholders)
                     if st.button("Log aggregate metric placeholders to LangSmith (latest run)"):
                         try:
                             latest_run_id = turns[-1]["run_id"] or None
@@ -627,7 +635,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                             else:
                                 for k in ["faithfulness", "answer_relevancy"]:
                                     ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
-                                st.success("Logged placeholder RAGAS keys to LangSmith (customize if needed).")
+                                st.success("Logged placeholder RAGAS keys to LangSmith (customize if you want real aggregates).")
                         except Exception as e:
                             st.info(f"Feedback logging failed: {e}")
 

@@ -43,6 +43,7 @@ HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
     st.stop()
+# Make sure the HF endpoint sees the token
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
@@ -620,7 +621,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                         temperature=0.2,
                         top_p=0.9,
                     )
-                    lc_chat = ChatHuggingFace(llm=endpoint)  # IMPORTANT: pass the endpoint as llm=
+                    lc_chat = ChatHuggingFace(llm=endpoint)  # pass endpoint as llm=
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"HF judge failed: {e}")
@@ -633,7 +634,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     with st.spinner("Scoring with RAGAS…"):
                         scores = evaluate(
                             dataset=ds,
-                            metrics=[Faithfulness(), AnswerRelevancy()],  # only metrics that need no reference
+                            metrics=[Faithfulness(), AnswerRelevancy()],  # reference-free metrics only
                             llm=judge,                                     # <- ensures HF judge is used
                             show_progress=True,
                         )

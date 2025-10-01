@@ -29,9 +29,9 @@ from langsmith.run_helpers import trace, tracing_context, get_current_run_tree
 from ragas import evaluate, EvaluationDataset
 from ragas.metrics import Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
-from ragas.embeddings import LangchainEmbeddings  # <-- use LC wrapper
+ 
 
-# -------- LangChain (judge LLM + embeddings for RAGAS) --------
+# -------- LangChain (judge LLM + embeddings for RAGAS) --------lc_emb = LcHfEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain_huggingface import HuggingFaceEmbeddings as LcHfEmbeddings  # <-- embeddings impl
 
@@ -602,10 +602,10 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                     judge = None
 
                 # --- HF Embeddings for RAGAS (prevents OpenAI fallback) ---
+                
                 @st.cache_resource(show_spinner=False)
                 def get_ragas_embeddings():
-                    lc_emb = LcHfEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-                    return LangchainEmbeddings(lc_emb)
+                    return LcHfEmbeddings(model_name="BAAI/bge-small-en-v1.5")
                 hf_emb = get_ragas_embeddings()
 
                 if judge is None:

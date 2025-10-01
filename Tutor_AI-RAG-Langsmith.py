@@ -27,7 +27,7 @@ from langsmith.run_helpers import trace, tracing_context, get_current_run_tree
 
 # -------- RAGAS (evaluation) --------
 from ragas import evaluate, EvaluationDataset
-from ragas.metrics import Faithfulness, AnswerRelevancy, ContextPrecision
+from ragas.metrics import Faithfulness, AnswerRelevancy
 from ragas.llms import LangchainLLMWrapper
 
 # -------- LangChain (judge LLM wrapper for RAGAS) --------
@@ -590,7 +590,7 @@ if user_prompt:
 # ===========================
 st.markdown("---")
 with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
-    st.write("Runs **faithfulness**, **answer relevancy**, and **context precision** on the last N chats of this session. Optionally logs aggregate metrics to LangSmith on the latest run.")
+    st.write("Runs **faithfulness**, **answer relevancy** on the last N chats of this session. Optionally logs aggregate metrics to LangSmith on the latest run.")
     N = st.slider("How many recent chats to evaluate?", min_value=1, max_value=50,
                   value=min(10, len(st.session_state.turn_logs)) if st.session_state.turn_logs else 5)
     if st.button("Run RAGAS now"):
@@ -648,7 +648,7 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                                 st.info("No run_id to attach feedback.")
                             else:
                                 # You can parse 'scores' to extract real aggregates; here we write placeholders safely.
-                                for k in ["faithfulness", "answer_relevancy", "context_precision"]:
+                                for k in ["faithfulness", "answer_relevancy"]:
                                     ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
                                 st.success("Logged placeholder RAGAS keys to LangSmith (customize parsing as needed).")
                         except Exception as e:

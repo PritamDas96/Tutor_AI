@@ -590,7 +590,7 @@ if user_prompt:
 # ===========================
 st.markdown("---")
 with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
-    st.write("Runs **faithfulness**, **answer relevancy** on the last N chats of this session. Optionally logs aggregate metrics to LangSmith on the latest run.")
+    st.write("Runs **faithfulness** and **answer relevancy** on the last N chats of this session. Optionally logs aggregate metrics to LangSmith on the latest run.")
     N = st.slider("How many recent chats to evaluate?", min_value=1, max_value=50,
                   value=min(10, len(st.session_state.turn_logs)) if st.session_state.turn_logs else 5)
     if st.button("Run RAGAS now"):
@@ -613,26 +613,29 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                 # Judge LLM via LangChain → HF Inference; wrap for RAGAS
                 try:
                     endpoint = HuggingFaceEndpoint(
-                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",   # choose any chat-capable model you have access to
+                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",  # choose any chat-capable model you have access to
                         task="text-generation",
                         huggingfacehub_api_token=os.environ["HUGGINGFACEHUB_API_TOKEN"],
                         max_new_tokens=256,
                         temperature=0.2,
                         top_p=0.9,
                     )
-                    lc_chat = ChatHuggingFace(llm=endpoint)  # IMPORTANT: use keyword 'client'
+                    lc_chat = ChatHuggingFace(llm=endpoint)  # IMPORTANT: pass the endpoint as llm=
                     judge = LangchainLLMWrapper(lc_chat)
                 except Exception as e:
                     st.error(f"HF judge failed: {e}")
                     judge = None
+
                 if judge is None:
-                    st.stop() 
+                    st.error("HF judge did not initialize. Check HF token / model access.")
+                    st.stop()
                 else:
-                    scores = evaluate(
-                        dataset=ds,
-                        metrics=[Faithfulness(), AnswerRelevancy()],
-                        llm=judge,
-                        show_progress=True,
+                    with st.spinner("Scoring with RAGAS…"):
+                        scores = evaluate(
+                            dataset=ds,
+                            metrics=[Faithfulness(), AnswerRelevancy()],  # only metrics that need no reference
+                            llm=judge,                                     # <- ensures HF judge is used
+                            show_progress=True,
                         )
                     st.subheader("📈 RAGAS Results")
                     try:
@@ -647,10 +650,9 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                             if not latest_run_id:
                                 st.info("No run_id to attach feedback.")
                             else:
-                                # You can parse 'scores' to extract real aggregates; here we write placeholders safely.
                                 for k in ["faithfulness", "answer_relevancy"]:
                                     ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
-                                st.success("Logged placeholder RAGAS keys to LangSmith (customize parsing as needed).")
+                                st.success("Logged placeholder RAGAS keys to LangSmith (customize parsing if you want real numbers).")
                         except Exception as e:
                             st.info(f"Feedback logging failed: {e}")
 

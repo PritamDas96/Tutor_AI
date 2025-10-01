@@ -185,8 +185,7 @@ DOC_LINKS = [
      "url":"https://arxiv.org/pdf/2403.18105", "enabled":True},
     {"title":"Generative AI for Education (GAIED): Advances, Opportunities, and Challenges (2024) — arXiv",
      "url":"https://arxiv.org/abs/2402.01580", "enabled":True},
-    {"title":"Generative AI in Higher Education: Trends, Challenges, & Future Directions (2024) — MDPI OA",
-     "url":"https://www.mdpi.com/2078-2489/15/11/676", "enabled":True},
+    
 ]
 
 # -------- Fetch & Clean --------

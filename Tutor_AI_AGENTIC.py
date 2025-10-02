@@ -1,6 +1,6 @@
 # app.py
-# GenAI-Tutor (Agentic, ReAct) — RAG + Tools + LangSmith (HF-only)
-# Robust against HF models' imperfect tool-calls by using single-input tools + permissive parsing.
+# GenAI-Tutor (Agentic ReAct) — RAG + Tools + LangSmith (HF-only)
+# Fix: ReAct prompt now includes both {tools} and {tool_names} so create_react_agent can render.
 
 import os, io, json, re, hashlib, requests
 from typing import List, Dict, Any, Tuple
@@ -20,7 +20,6 @@ from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 
 # LangChain (ReAct agent + tools + prompt)
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langchain.memory import ConversationBufferMemory
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain_core.tools import Tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -192,18 +191,14 @@ _global_rag = {"index": None, "side": None}
 # Tool helpers: permissive parsing
 # -------------------------------
 def extract_json_block(text: str) -> Dict[str, Any]:
-    # try to find a JSON object in the text
     try:
-        # match first {...} block
         m = re.search(r"\{.*\}", text, flags=re.S)
-        if m:
-            return json.loads(m.group(0))
+        if m: return json.loads(m.group(0))
     except Exception:
         pass
     return {}
 
 def parse_kv(text: str) -> Dict[str, Any]:
-    # parse "key=value" pairs like query=foo max_results=5
     out = {}
     for part in re.split(r"[,\n;]\s*|\s{2,}", text):
         if "=" in part:
@@ -270,8 +265,7 @@ def tool_rag_retrieve(inp: str) -> str:
     data = extract_json_block(inp) or parse_kv(inp)
     q = data.get("query") or inp.strip()
     try:
-        k = int(data.get("top_k", TOP_K))
-        k = max(1, min(10, k))
+        k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
     except:
         k = TOP_K
     results = retrieve(q, _global_rag["index"], _global_rag["side"])[:k]
@@ -279,8 +273,8 @@ def tool_rag_retrieve(inp: str) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 TOOLS: List[Tool] = [
-    Tool(name="web_search", func=tool_web_search, description="Search the web. Input: natural language or JSON with {query, max_results}. Output: JSON list."),
-    Tool(name="read_url", func=tool_read_url, description="Read and clean a URL (HTML/PDF). Input: URL or JSON {url, max_chars}. Output: JSON object."),
+    Tool(name="web_search", func=tool_web_search, description="Search the web. Input: natural language or JSON {query, max_results}. Output: JSON list."),
+    Tool(name="read_url", func=tool_read_url, description="Read a URL (HTML/PDF). Input: URL or JSON {url, max_chars}. Output: JSON object."),
     Tool(name="rag_retrieve", func=tool_rag_retrieve, description="Retrieve from curated Gen-AI corpus. Input: natural language or JSON {query, top_k}. Output: JSON list."),
 ]
 
@@ -326,7 +320,7 @@ with st.sidebar:
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # -------------------------------
-# Build ReAct Agent
+# Build ReAct Agent (FIXED PROMPT)
 # -------------------------------
 def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
     endpoint = HuggingFaceEndpoint(
@@ -338,13 +332,14 @@ def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
         top_p=0.9,
     )
     llm = ChatHuggingFace(llm=endpoint)
-    tools = TOOLS if use_tools else [TOOLS[-1]]  # rag_retrieve only if tools disabled
+    tools = TOOLS if use_tools else [TOOLS[-1]]  # rag_retrieve only if disabled
 
-    # ReAct prompt (clear formatting)
+    # ✅ Include BOTH {tools} and {tool_names}
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
              "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
+             "TOOLS:\n{tools}\n\n"
              "Use the ReAct format:\n"
              "Thought: reason about what to do next.\n"
              "Action: one of [{tool_names}] if you need it, else say Final Answer.\n"
@@ -366,7 +361,6 @@ def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
         max_iterations=max_iterations,
         handle_parsing_errors=True,
         return_intermediate_steps=True,
-        # memory is handled outside for Streamlit history rendering
     )
     return executor
 
@@ -406,8 +400,7 @@ user_q = st.chat_input("Ask a question. The agent may use WebSearch, ReadURL, or
 if user_q:
     st.session_state.messages.append({"role":"user","content":user_q})
     agent = get_react_agent(model_id, enable_agent, max_steps)
-    # Build chat_history for prompt (LangChain expects BaseMessages; we just send text in memoryless mode)
-    chat_history = []  # we display history ourselves; ReAct agent keeps its own scratchpad
+    chat_history = []  # no memory in prompt; we render history ourselves
 
     with tracing_context(project_name=LS_PROJECT, metadata={"type":"agent_turn","scenario":scenario_name,"model":model_id}):
         with trace("agent_turn", run_type="chain", inputs={"question": user_q}):
@@ -427,7 +420,6 @@ if user_q:
                         error_text = f"Agent exception: {e}"
 
                 if not reply.strip():
-                    # Always answer something
                     reply = hf_direct_reply(model_id, f"{SCENARIOS[scenario_name]['system']}\n\nUser question: {user_q}")
 
                 st.markdown(reply or "No reply.")

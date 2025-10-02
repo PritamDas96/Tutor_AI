@@ -1,38 +1,39 @@
 # app.py
 # GenAI-Tutor (Agentic) — RAG + 3 Tools (WebSearch, URLReader, RAGRetriever) via LangChain
 # ----------------------------------------------------------------------------------------
-# - HF-only (no OpenAI). Uses Hugging Face Inference and tokenizers locally for counts if needed.
+# - HF-only: no OpenAI usage anywhere.
 # - Tools:
-#     1) WebSearchTool (DuckDuckGo, no API key)  -> top results (title, url, snippet)
-#     2) URLReaderTool  (requests + trafilatura/pypdf) -> cleaned text from HTML/PDF
-#     3) RAGRetrieverTool (your FAISS+BGE index) -> top-k chunks with URLs/titles
-# - Agent: ZERO_SHOT_REACT_DESCRIPTION (ReAct), step-capped, with optional memory.
-# - UI: Sidebar settings, RAG management, chat with agent, step trace, and evidence display.
-# - Observability: Simple prints to Streamlit; (optional) wire to LangSmith if desired.
+#     1) WebSearchTool (DuckDuckGo) -> [{'title','url','snippet'}]
+#     2) URLReaderTool  (requests + HTML/PDF clean) -> {'title','url','text'}
+#     3) RAGRetrieverTool (FAISS + BGE + reranker) -> [{'title','url','chunk','score'}]
+# - Agent: STRUCTURED_CHAT_ZERO_SHOT (ReAct-like), step-capped, with memory.
+# - RAG: top_k=7 with rerank; 5 curated sources (public).
+# - Observability: LangSmith tracing for LLM + tools; thumbs feedback recorded to latest run.
 
 import os
 import io
-import time
 import json
+import time
 import hashlib
 from typing import List, Dict, Any, Tuple
 
 import requests
 import numpy as np
 import streamlit as st
-
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# DuckDuckGo search (no key)
 from duckduckgo_search import DDGS
-
-# HF chat (direct for simple calls) + tokenizer (optional)
-from huggingface_hub import InferenceClient
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer
+from huggingface_hub import InferenceClient
+
+# LangSmith (observability)
+from langsmith import Client
+from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 
 # LangChain agent + tools
+from pydantic import BaseModel, Field
 from langchain.agents import initialize_agent, AgentType
 from langchain_core.tools import tool
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
@@ -41,14 +42,20 @@ from langchain.memory import ConversationBufferMemory
 # ===========================
 # App Config & Secrets
 # ===========================
-st.set_page_config(page_title="GenAI-Tutor (Agentic RAG)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Agentic Learning Assistant (RAG + Tools)</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor (Agentic RAG + Tools)", layout="wide")
+st.markdown("<h1>🎓 GenAI-Tutor — Agentic Learning Assistant (RAG + Tools + LangSmith)</h1>", unsafe_allow_html=True)
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
     st.stop()
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
+
+# LangSmith env (auto-tracing for LangChain)
+os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
+os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
+LS_PROJECT = st.secrets.get("LANGSMITH_PROJECT", os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-Agentic"))
+ls_client = Client()
 
 # ===========================
 # HF Chat Models (open-source)
@@ -62,7 +69,7 @@ HF_MODELS = [
 ]
 
 # ===========================
-# Learning Scenarios (for tone)
+# Learning Scenarios (tone/system intent)
 # ===========================
 SCENARIOS: Dict[str, Dict[str, str]] = {
     "Prompt Engineering Basics": {
@@ -176,6 +183,7 @@ def chunk_text(text: str, url: str, title: str,
         piece = " ".join(words[start:end])
         chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
         chunks.append({"chunk_id": chunk_id, "title": title, "url": url, "text": piece})
+    # move window
         if end == len(words):
             break
         start = max(0, end - overlap_words)
@@ -198,7 +206,7 @@ def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
 def build_faiss(vectors: np.ndarray):
     import faiss
     d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)  # cosine via IP on normalized vectors
+    index = faiss.IndexFlatIP(d)  # cosine via IP when vectors normalized
     index.add(vectors)
     return index
 
@@ -229,21 +237,17 @@ def retrieve(query: str, index, side: Dict[str, Any],
     import faiss  # noqa
     embedder = load_embedder()
     reranker = load_reranker()
-
     qv = embed_texts([query], embedder)
     scores, idx = index.search(qv, k_candidates)
-    cand_ids, cand_scores = idx[0].tolist(), scores[0].tolist()
-
+    cand_ids, _ = idx[0].tolist(), scores[0].tolist()
     candidates = []
-    for pos, (ci, s) in enumerate(zip(cand_ids, cand_scores)):
+    for pos, ci in enumerate(cand_ids, start=1):
         if ci < 0:
             continue
         c = side["chunks"][ci]
-        candidates.append({"rank_ann": pos + 1, "score_ann": float(s), **c})
-
+        candidates.append({"rank_ann": pos, **c})
     if not candidates:
         return []
-
     pairs = [(query, c["text"]) for c in candidates]
     rerank_scores = reranker.predict(pairs, batch_size=64).tolist()
     for c, rs in zip(candidates, rerank_scores):
@@ -252,15 +256,14 @@ def retrieve(query: str, index, side: Dict[str, Any],
     return candidates[:top_k]
 
 # ============================================================
-#                         Tools
+#                         Tools (schema-based)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def cached_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Cache DuckDuckGo results for a few minutes."""
     out = []
     try:
         with DDGS() as ddg:
-            for r in ddg.text(query, max_results=max_results):
+            for r in ddg.text(query, max_results=max_results, safesearch="moderate"):
                 title = r.get("title") or ""
                 url = r.get("href") or r.get("url") or ""
                 snippet = r.get("body") or ""
@@ -270,44 +273,49 @@ def cached_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         st.info(f"Web search error ({e}).")
     return out
 
-@tool
-def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+class WebSearchInput(BaseModel):
+    query: str = Field(..., description="The web search query.")
+    max_results: int = Field(5, ge=1, le=10, description="Number of results to return (1-10).")
+
+@tool("web_search", args_schema=WebSearchInput)
+def web_search_tool(query: str, max_results: int = 5) -> list[dict]:
     """Search the web (DuckDuckGo) and return a list of {'title','url','snippet'}."""
     return cached_search(query=query, max_results=max_results)
 
 @st.cache_data(show_spinner=False)
 def cached_read_url(url: str, max_chars: int = 6000) -> Dict[str, str]:
-    """Fetch and clean a URL (HTML/PDF). Returns {'title','url','text'}."""
     try:
         resp = requests.get(url, headers={"User-Agent": "TutorAI/1.0"}, timeout=25)
         resp.raise_for_status()
         ctype = (resp.headers.get("Content-Type", "")).lower()
         if "pdf" in ctype or url.lower().endswith(".pdf"):
-            # PDF
             text = _clean_pdf(resp.content)
-            title = url
         else:
-            # HTML
             text = _clean_html(resp.content)
-            title = url
-        text = (text or "")[:max_chars]
-        return {"title": title, "url": url, "text": text}
+        return {"title": url, "url": url, "text": (text or "")[:max_chars]}
     except Exception as e:
         return {"title": url, "url": url, "text": f"[Error fetching URL: {e}]"}
     
-@tool
-def read_url(url: str, max_chars: int = 6000) -> Dict[str, str]:
+class ReadUrlInput(BaseModel):
+    url: str = Field(..., description="The URL to fetch (HTML or PDF).")
+    max_chars: int = Field(6000, ge=500, le=20000, description="Max characters to return.")
+
+@tool("read_url", args_schema=ReadUrlInput)
+def read_url_tool(url: str, max_chars: int = 6000) -> dict:
     """Open a URL and extract clean text from HTML or PDF. Returns {'title','url','text'}."""
     return cached_read_url(url=url, max_chars=max_chars)
 
-# RAGRetriever tool depends on an index built at runtime
 _global_rag = {"index": None, "side": None}
 
-@tool
-def rag_retrieve(query: str, top_k: int = 7) -> List[Dict[str, Any]]:
+class RAGRetrieveInput(BaseModel):
+    query: str = Field(..., description="The user query to retrieve evidence for.")
+    top_k: int = Field(7, ge=1, le=10, description="Top-k chunks to return.")
+
+@tool("rag_retrieve", args_schema=RAGRetrieveInput)
+def rag_retrieve_tool(query: str, top_k: int = 7) -> list[dict]:
     """Retrieve top-k chunks from TutorAI’s curated Gen-AI corpus. Returns [{'title','url','chunk','score'}]."""
     if _global_rag["index"] is None or _global_rag["side"] is None:
-        return [{"error": "RAG index not initialized. Press 'Build/Refresh RAG Index' in the app and retry."}]
+        return [{"error": "RAG index not initialized. Click 'Build/Refresh RAG Index' and try again."}]
     index, side = _global_rag["index"], _global_rag["side"]
     results = retrieve(query, index, side, top_k=top_k, k_candidates=max(2*top_k, 20))
     out = []
@@ -321,7 +329,7 @@ def rag_retrieve(query: str, top_k: int = 7) -> List[Dict[str, Any]]:
     return out
 
 # ============================================================
-#                    HF Chat (for direct calls)
+#                    HF Tokenizer (optional counts)
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def get_tokenizer_for(model_id: str):
@@ -334,7 +342,6 @@ def count_chat_tokens(model_id: str, messages: List[Dict[str, str]], completion_
     tok = get_tokenizer_for(model_id)
     if tok is None:
         return 0, 0
-    # Try chat template
     try:
         ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
         prompt_tokens = len(ids)
@@ -351,7 +358,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
-    st.caption("HF token comes from Secrets.")
+    st.caption("HF & LangSmith settings come from Secrets.")
     st.markdown("---")
     st.subheader("🧰 Agent Tools")
     enable_agent = st.checkbox("Enable Tools (Agentic)", value=True)
@@ -368,8 +375,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Failed to build RAG index: {e}")
     with c2:
-        st.caption("Uses 5 curated sources; top-k=7 + reranker.")
-
+        st.caption("Uses 5 curated sources; top-k=7 with reranking.")
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # ============================================================
@@ -377,7 +383,6 @@ st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def get_agent(model_id: str, use_tools: bool, max_iterations: int):
-    # HF endpoint as LangChain ChatModel
     endpoint = HuggingFaceEndpoint(
         repo_id=model_id,
         task="text-generation",
@@ -387,22 +392,18 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
         top_p=0.9,
     )
     llm = ChatHuggingFace(llm=endpoint)
-
-    # Memory: keep running dialogue (optional)
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    tools = [rag_retrieve_tool] if not use_tools else [web_search_tool, read_url_tool, rag_retrieve_tool]
 
-    # Tool list
-    tools = [rag_retrieve] if not use_tools else [web_search, read_url, rag_retrieve]
-
-    # Agent
     agent = initialize_agent(
         tools=tools,
         llm=llm,
-        agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,  # ReAct-style
+        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT,   # supports multi-arg tools
         verbose=False,
         max_iterations=max_iterations,
         handle_parsing_errors=True,
         memory=memory,
+        return_intermediate_steps=True,              # make intermediate steps available
     )
     return agent
 
@@ -416,6 +417,8 @@ if "messages" not in st.session_state:
     ]
 if "scenario_prev" not in st.session_state:
     st.session_state.scenario_prev = scenario_name
+if "turn_logs" not in st.session_state:
+    st.session_state.turn_logs = []
 
 def _seed_chat():
     st.session_state.messages = [
@@ -433,82 +436,120 @@ if st.session_state.scenario_prev != scenario_name:
 st.markdown("---")
 st.subheader("💬 Tutor Chat (Agentic)")
 
-# Show history
+# History
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
         st.markdown(m["content"])
 
-user_prompt = st.chat_input("Ask a question (the agent may search the web, read a URL, or use RAG)…")
-if user_prompt:
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
+user_q = st.chat_input("Ask a question. The agent may use WebSearch, ReadURL, or RAG…")
+if user_q:
+    st.session_state.messages.append({"role": "user", "content": user_q})
 
-    # Build agent
+    # Build the agent
     agent = get_agent(model_id=model_id, use_tools=enable_agent, max_iterations=max_steps)
 
-    # Build the agent input using last N turns as context string (agent also has memory)
-    # You can keep it simple and just pass the last user question:
-    agent_input = {"input": user_prompt}
+    # Compose input with scenario intent (keeps agent aware of role)
+    scenario_system = SCENARIOS[scenario_name]["system"]
+    agent_input = {
+        "input": f"{scenario_system}\n\nUser question: {user_q}"
+    }
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking with tools…"):
+    with tracing_context(project_name=LS_PROJECT, metadata={
+        "type": "agent_turn", "scenario": scenario_name, "model": model_id, "tools": "on" if enable_agent else "rag_only"
+    }):
+        with trace("agent_turn", run_type="chain", inputs={"question": user_q}) as root:
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking with tools…"):
+                    try:
+                        # Return intermediate steps so we can show tool calls & observations
+                        result = agent.invoke(agent_input, config={
+                            "metadata": {"scenario": scenario_name, "model": model_id, "tools_enabled": enable_agent},
+                            "tags": ["TutorAI", "Agentic", "RAG"],
+                            "run_name": "TutorAI-Agentic-Turn",
+                        })
+                        reply = result["output"]
+                        inter = result.get("intermediate_steps", [])
+                    except Exception as e:
+                        reply = f"⚠️ Agent error: {e}"
+                        inter = []
+
+                st.markdown(reply)
+
+                # Agent trace (tool calls)
+                if inter:
+                    with st.expander("🔍 Agent Trace (tools & observations)"):
+                        for i, (tool_call, observation) in enumerate(inter, start=1):
+                            st.markdown(f"**Step {i}: `{tool_call.tool}`**")
+                            try:
+                                args_str = json.dumps(tool_call.tool_input, ensure_ascii=False)
+                            except Exception:
+                                args_str = str(tool_call.tool_input)
+                            st.code(args_str, language="json")
+
+                            obs_view = observation
+                            try:
+                                if isinstance(observation, (list, dict)):
+                                    obs_view = json.dumps(observation, ensure_ascii=False)[:1200]
+                                elif isinstance(observation, str):
+                                    obs_view = observation[:1200]
+                            except Exception:
+                                obs_view = str(observation)[:1200]
+                            st.text_area("Observation", value=obs_view, height=160)
+
+                # Evidence from rag_retrieve (if used this turn)
+                rag_cards = []
+                for (tool_call, observation) in inter or []:
+                    if tool_call.tool == "rag_retrieve" and isinstance(observation, list):
+                        for item in observation[:TOP_K]:
+                            if isinstance(item, dict) and all(k in item for k in ["title", "url", "chunk"]):
+                                rag_cards.append(item)
+                if rag_cards:
+                    with st.expander("📚 Retrieved Evidence (RAG)"):
+                        for i, it in enumerate(rag_cards, 1):
+                            st.markdown(f"**[{i}] [{it['title']}]({it['url']})**")
+                            st.write(it["chunk"][:500] + ("…" if len(it["chunk"]) > 500 else ""))
+
+                # Thumbs → LangSmith feedback on latest run
+                with st.expander("Rate this answer"):
+                    col1, col2 = st.columns(2)
+                    if col1.button("👍 Helpful"):
+                        try:
+                            rid = str(get_current_run_tree().id)
+                            ls_client.create_feedback(run_id=rid, key="user_score", score=1)
+                            st.success("Thanks! Logged to LangSmith.")
+                        except Exception:
+                            st.info("Feedback logging failed (check LangSmith key).")
+                    if col2.button("👎 Not helpful"):
+                        try:
+                            rid = str(get_current_run_tree().id)
+                            ls_client.create_feedback(run_id=rid, key="user_score", score=0)
+                            st.info("Feedback recorded.")
+                        except Exception:
+                            st.info("Feedback logging failed (check LangSmith key).")
+
+            # Append to session log
             try:
-                # Return intermediate steps so we can show tool calls & observations
-                result = agent.invoke(agent_input, config={"return_intermediate_steps": True})
-                reply = result["output"]
-                inter = result.get("intermediate_steps", [])
-            except Exception as e:
-                reply = f"⚠️ Agent error: {e}"
-                inter = []
-
-        st.markdown(reply)
-
-        # Show agent trace
-        if inter:
-            with st.expander("🔍 Agent Trace (tools & observations)"):
-                for i, (tool_call, observation) in enumerate(inter, start=1):
-                    st.markdown(f"**Step {i}: {tool_call.tool}**")
-                    try:
-                        args_str = json.dumps(tool_call.tool_input, ensure_ascii=False)
-                    except Exception:
-                        args_str = str(tool_call.tool_input)
-                    st.code(args_str, language="json")
-
-                    # Observations can be long (e.g., chunks). Truncate for view.
-                    obs_view = observation
-                    try:
-                        if isinstance(observation, (list, dict)):
-                            obs_view = json.dumps(observation, ensure_ascii=False)[:1200]
-                        elif isinstance(observation, str):
-                            obs_view = observation[:1200]
-                    except Exception:
-                        obs_view = str(observation)[:1200]
-                    st.text_area("Observation", value=obs_view, height=160)
-
-        # Evidence view (from RAG tool if used)
-        # Parse intermediate steps for rag_retrieve returns:
-        rag_cards = []
-        for (tool_call, observation) in inter:
-            if tool_call.tool == "rag_retrieve" and isinstance(observation, list):
-                for item in observation[:TOP_K]:
-                    if isinstance(item, dict) and "title" in item and "url" in item and "chunk" in item:
-                        rag_cards.append(item)
-        if rag_cards:
-            with st.expander("📚 Retrieved Evidence (RAG)"):
-                for i, it in enumerate(rag_cards, 1):
-                    st.markdown(f"**[{i}] [{it['title']}]({it['url']})**")
-                    st.write(it["chunk"][:500] + ("…" if len(it["chunk"]) > 500 else ""))
+                rid = str(get_current_run_tree().id)
+            except Exception:
+                rid = ""
+            st.session_state.turn_logs.append({
+                "run_id": rid,
+                "question": user_q,
+                "answer": reply,
+                "contexts": [it.get("chunk", "") for it in rag_cards],
+            })
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
 
-# ============================================================
+# ===========================
 #                         Scenario Overview
-# ============================================================
+# ===========================
 st.markdown("---")
 st.subheader("📌 Scenario Overview")
 st.markdown(f"**{scenario_name}**  \n{SCENARIOS[scenario_name]['overview']}")
 
-# ============================================================
+# ===========================
 #                         Footer
-# ============================================================
+# ===========================
 st.markdown("---")
 st.caption("GenAI-Tutor is educational. Verify critical info. Follow your organization’s policies.")

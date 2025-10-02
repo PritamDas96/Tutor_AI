@@ -1,8 +1,7 @@
-# --- core app deps (unchanged) ---
 streamlit
 huggingface_hub>=0.24
 sentence-transformers>=2.6.1
-torch           # don’t pin on 3.13; let it resolve
+torch          
 faiss-cpu>=1.7.4
 pypdf>=4.2.0
 beautifulsoup4>=4.12.2
@@ -12,10 +11,30 @@ requests>=2.31.0
 langsmith
 ragas>=0.3.5
 
-# Use the 0.3 LangChain family to satisfy langchain-huggingface
 langchain-core>=0.3.70,<1.0
 langchain-huggingface==0.3.1
 datasets>=2.19
 pandas
 tqdm
 tenacity
+
+# Hugging Face + models
+huggingface_hub>=0.24
+transformers>=4.43
+tokenizers>=0.15
+sentence-transformers>=2.6.1
+torch
+
+# Retrieval stack
+faiss-cpu>=1.7.4
+
+# Parsing
+beautifulsoup4>=4.12.2
+pypdf>=4.2.0
+requests>=2.31.0
+duckduckgo-search>=6.1.0
+
+# LangChain agents
+langchain>=0.3.0
+langchain-core>=0.3.70,<1.0
+langchain-huggingface==0.3.1

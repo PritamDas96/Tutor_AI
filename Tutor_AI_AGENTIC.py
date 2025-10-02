@@ -1,14 +1,13 @@
 # app.py
-# GenAI-Tutor (Agentic) — RAG + 3 Tools (WebSearch, URLReader, RAGRetriever) via LangChain
-# ----------------------------------------------------------------------------------------
-# - HF-only: no OpenAI usage anywhere.
-# - Tools:
-#     1) WebSearchTool (DuckDuckGo) -> [{'title','url','snippet'}]
-#     2) URLReaderTool  (requests + HTML/PDF clean) -> {'title','url','text'}
-#     3) RAGRetrieverTool (FAISS + BGE + reranker) -> [{'title','url','chunk','score'}]
-# - Agent: STRUCTURED_CHAT_ZERO_SHOT (ReAct-like), step-capped, with memory.
-# - RAG: top_k=7 with rerank; 5 curated sources (public).
-# - Observability: LangSmith tracing for LLM + tools; thumbs feedback recorded to latest run.
+# GenAI-Tutor (Agentic) — RAG + Tools + LangSmith (HF-only)
+# ---------------------------------------------------------
+# Tools:
+#   1) web_search (DuckDuckGo, no key) -> [{'title','url','snippet'}]
+#   2) read_url (requests + HTML/PDF clean) -> {'title','url','text'}
+#   3) rag_retrieve (FAISS + BGE + reranker) -> [{'title','url','chunk','score'}]
+# Agent: Structured Chat (multi-arg tools supported) with HF chat model
+# RAG: top_k=7 with rerank; 5 curated public sources
+# Observability: LangSmith tracing + thumbs feedback to latest run
 
 import os
 import io
@@ -28,16 +27,17 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer
 from huggingface_hub import InferenceClient
 
-# LangSmith (observability)
+# LangSmith
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 
-# LangChain agent + tools
+# LangChain (agent + tools + prompt)
 from pydantic import BaseModel, Field
-from langchain.agents import initialize_agent, AgentType
 from langchain_core.tools import tool
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain.memory import ConversationBufferMemory
+from langchain.agents import AgentExecutor, create_structured_chat_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # ===========================
 # App Config & Secrets
@@ -104,7 +104,7 @@ SCENARIOS: Dict[str, Dict[str, str]] = {
 SCENARIO_NAMES = list(SCENARIOS.keys())
 
 # ===========================
-# Accessible RAG Sources (5)
+# RAG Sources (5 public)
 # ===========================
 DOC_LINKS = [
     {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
@@ -183,7 +183,6 @@ def chunk_text(text: str, url: str, title: str,
         piece = " ".join(words[start:end])
         chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
         chunks.append({"chunk_id": chunk_id, "title": title, "url": url, "text": piece})
-    # move window
         if end == len(words):
             break
         start = max(0, end - overlap_words)
@@ -206,7 +205,7 @@ def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
 def build_faiss(vectors: np.ndarray):
     import faiss
     d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)  # cosine via IP when vectors normalized
+    index = faiss.IndexFlatIP(d)  # cosine via IP on normalized vecs
     index.add(vectors)
     return index
 
@@ -237,17 +236,21 @@ def retrieve(query: str, index, side: Dict[str, Any],
     import faiss  # noqa
     embedder = load_embedder()
     reranker = load_reranker()
+
     qv = embed_texts([query], embedder)
     scores, idx = index.search(qv, k_candidates)
-    cand_ids, _ = idx[0].tolist(), scores[0].tolist()
+    cand_ids, cand_scores = idx[0].tolist(), scores[0].tolist()
+
     candidates = []
-    for pos, ci in enumerate(cand_ids, start=1):
+    for pos, (ci, s) in enumerate(zip(cand_ids, cand_scores), start=1):
         if ci < 0:
             continue
         c = side["chunks"][ci]
-        candidates.append({"rank_ann": pos, **c})
+        candidates.append({"rank_ann": pos, "score_ann": float(s), **c})
+
     if not candidates:
         return []
+
     pairs = [(query, c["text"]) for c in candidates]
     rerank_scores = reranker.predict(pairs, batch_size=64).tolist()
     for c, rs in zip(candidates, rerank_scores):
@@ -379,7 +382,7 @@ with st.sidebar:
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # ============================================================
-#                Agent Construction (LangChain)
+#                Agent Construction (Structured Chat)
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def get_agent(model_id: str, use_tools: bool, max_iterations: int):
@@ -392,20 +395,32 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
         top_p=0.9,
     )
     llm = ChatHuggingFace(llm=endpoint)
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     tools = [rag_retrieve_tool] if not use_tools else [web_search_tool, read_url_tool, rag_retrieve_tool]
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-    agent = initialize_agent(
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system",
+             "You are GenAI-Tutor, an expert and safe assistant for Gen-AI learning. "
+             "Decide when to use tools (web_search, read_url, rag_retrieve). Think step-by-step. "
+             "Use citations when you rely on external content. If a tool fails, try another or summarize partial results."),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ]
+    )
+    agent = create_structured_chat_agent(llm=llm, tools=tools, prompt=prompt)
+
+    executor = AgentExecutor(
+        agent=agent,
         tools=tools,
-        llm=llm,
-        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT,   # supports multi-arg tools
         verbose=False,
         max_iterations=max_iterations,
         handle_parsing_errors=True,
+        return_intermediate_steps=True,
         memory=memory,
-        return_intermediate_steps=True,              # make intermediate steps available
     )
-    return agent
+    return executor
 
 # ============================================================
 #                        Chat State
@@ -445,23 +460,17 @@ user_q = st.chat_input("Ask a question. The agent may use WebSearch, ReadURL, or
 if user_q:
     st.session_state.messages.append({"role": "user", "content": user_q})
 
-    # Build the agent
     agent = get_agent(model_id=model_id, use_tools=enable_agent, max_iterations=max_steps)
-
-    # Compose input with scenario intent (keeps agent aware of role)
     scenario_system = SCENARIOS[scenario_name]["system"]
-    agent_input = {
-        "input": f"{scenario_system}\n\nUser question: {user_q}"
-    }
+    agent_input = {"input": f"{scenario_system}\n\nUser question: {user_q}"}
 
     with tracing_context(project_name=LS_PROJECT, metadata={
         "type": "agent_turn", "scenario": scenario_name, "model": model_id, "tools": "on" if enable_agent else "rag_only"
     }):
-        with trace("agent_turn", run_type="chain", inputs={"question": user_q}) as root:
+        with trace("agent_turn", run_type="chain", inputs={"question": user_q}):
             with st.chat_message("assistant"):
                 with st.spinner("Thinking with tools…"):
                     try:
-                        # Return intermediate steps so we can show tool calls & observations
                         result = agent.invoke(agent_input, config={
                             "metadata": {"scenario": scenario_name, "model": model_id, "tools_enabled": enable_agent},
                             "tags": ["TutorAI", "Agentic", "RAG"],
@@ -485,7 +494,6 @@ if user_q:
                             except Exception:
                                 args_str = str(tool_call.tool_input)
                             st.code(args_str, language="json")
-
                             obs_view = observation
                             try:
                                 if isinstance(observation, (list, dict)):
@@ -509,7 +517,7 @@ if user_q:
                             st.markdown(f"**[{i}] [{it['title']}]({it['url']})**")
                             st.write(it["chunk"][:500] + ("…" if len(it["chunk"]) > 500 else ""))
 
-                # Thumbs → LangSmith feedback on latest run
+                # Thumbs → LangSmith
                 with st.expander("Rate this answer"):
                     col1, col2 = st.columns(2)
                     if col1.button("👍 Helpful"):

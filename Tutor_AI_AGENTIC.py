@@ -25,7 +25,6 @@ from pypdf import PdfReader
 from duckduckgo_search import DDGS
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer
-from huggingface_hub import InferenceClient
 
 # LangSmith
 from langsmith import Client
@@ -116,7 +115,7 @@ DOC_LINKS = [
     {"title": "Educational impacts of generative AI on learning & performance (2025) — Nature (PDF)",
      "url": "https://www.nature.com/articles/s41598-025-06930-w.pdf", "enabled": True},
     {"title": "Enhancing Retrieval-Augmented Generation: Best Practices — COLING 2025 (PDF)",
-     "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
+      "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
 ]
 
 # ============================================================
@@ -398,17 +397,21 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
     tools = [rag_retrieve_tool] if not use_tools else [web_search_tool, read_url_tool, rag_retrieve_tool]
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
+    # IMPORTANT: include {tools} and {tool_names} for structured-chat agent
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
-             "You are GenAI-Tutor, an expert and safe assistant for Gen-AI learning. "
-             "Decide when to use tools (web_search, read_url, rag_retrieve). Think step-by-step. "
-             "Use citations when you rely on external content. If a tool fails, try another or summarize partial results."),
+             "You are GenAI-Tutor, a safe and expert assistant for Gen-AI learning.\n"
+             "You may use external tools when helpful. Here are the tools you can use:\n{tools}\n\n"
+             "When you decide to use a tool, call it with the correct JSON args that match its schema.\n"
+             "Available tool names you may call: {tool_names}\n"
+             "Cite sources when you rely on external content. If a tool fails, try another or summarize partial results."),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ]
     )
+
     agent = create_structured_chat_agent(llm=llm, tools=tools, prompt=prompt)
 
     executor = AgentExecutor(

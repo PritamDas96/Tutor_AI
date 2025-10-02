@@ -312,7 +312,7 @@ CONTROLLER_SYSTEM = (
     "1) To call a tool:\n"
     '{  "tool": "rag_retrieve" | "web_search" | "read_url",  "input": "<single string>" }\n'
     "2) To finalize:\n"
-    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."}, ... ] }\n\n"
+    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."}, ... ] }'\n\n"
     "Notes:\n"
     "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
     "- Prefer rag_retrieve for Gen-AI learning topics; then at most one web_search.\n"

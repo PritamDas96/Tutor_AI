@@ -435,7 +435,8 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
              "Cite sources when you rely on external content. If a tool fails, try another or summarize partial results."),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
+            # 👇 Treat scratchpad as plain text so both str and list→str work across LC versions
+            ("assistant", "{agent_scratchpad}"),
         ]
     )
 

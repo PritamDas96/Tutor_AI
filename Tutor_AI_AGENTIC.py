@@ -1,13 +1,14 @@
 # app.py
-# GenAI-Tutor (Agentic) — RAG + Tools + LangSmith (HF-only)
-# ---------------------------------------------------------
+# GenAI-Tutor (Agentic) — RAG + Tools + LangSmith (HF-only, with safe fallback)
+# ---------------------------------------------------------------------------
 # Tools:
-#   1) web_search (DuckDuckGo, no key) -> [{'title','url','snippet'}]
-#   2) read_url (requests + HTML/PDF clean) -> {'title','url','text'}
+#   1) web_search (DuckDuckGo) -> [{'title','url','snippet'}]
+#   2) read_url (HTML/PDF fetch + clean) -> {'title','url','text'}
 #   3) rag_retrieve (FAISS + BGE + reranker) -> [{'title','url','chunk','score'}]
 # Agent: Structured Chat (multi-arg tools supported) with HF chat model
 # RAG: top_k=7 with rerank; 5 curated public sources
 # Observability: LangSmith tracing + thumbs feedback to latest run
+# Reliability: verbose agent, raw result inspector, and direct-HF fallback reply
 
 import os
 import io
@@ -25,6 +26,7 @@ from pypdf import PdfReader
 from duckduckgo_search import DDGS
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoTokenizer
+from huggingface_hub import InferenceClient
 
 # LangSmith
 from langsmith import Client
@@ -50,7 +52,7 @@ if not HF_TOKEN:
     st.stop()
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
-# LangSmith env (auto-tracing for LangChain)
+# LangSmith env
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
 os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
 LS_PROJECT = st.secrets.get("LANGSMITH_PROJECT", os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-Agentic"))
@@ -68,12 +70,12 @@ HF_MODELS = [
 ]
 
 # ===========================
-# Learning Scenarios (tone/system intent)
+# Learning Scenarios
 # ===========================
 SCENARIOS: Dict[str, Dict[str, str]] = {
     "Prompt Engineering Basics": {
         "overview": """- Core prompting concepts (role, task, context, constraints)
-- Patterns: few-shot, step-by-step, style/format guides
+- Few-shot, step-by-step, style/format guides
 - Practical templates for summaries, emails, brainstorming
 - Reducing hallucinations (be specific, ask for sources)""",
         "system": "You are GenAI-Tutor, an expert coach on prompt engineering for employees. Be concise, practical, and safe."
@@ -279,7 +281,9 @@ class WebSearchInput(BaseModel):
     query: str = Field(..., description="The web search query.")
     max_results: int = Field(5, ge=1, le=10, description="Number of results to return (1-10).")
 
-@tool("web_search", args_schema=WebSearchInput)
+from langchain_core.tools import tool as lc_tool  # alias to avoid confusion with st.tool
+
+@lc_tool("web_search", args_schema=WebSearchInput)
 def web_search_tool(query: str, max_results: int = 5) -> list[dict]:
     """Search the web (DuckDuckGo) and return a list of {'title','url','snippet'}."""
     return cached_search(query=query, max_results=max_results)
@@ -302,7 +306,7 @@ class ReadUrlInput(BaseModel):
     url: str = Field(..., description="The URL to fetch (HTML or PDF).")
     max_chars: int = Field(6000, ge=500, le=20000, description="Max characters to return.")
 
-@tool("read_url", args_schema=ReadUrlInput)
+@lc_tool("read_url", args_schema=ReadUrlInput)
 def read_url_tool(url: str, max_chars: int = 6000) -> dict:
     """Open a URL and extract clean text from HTML or PDF. Returns {'title','url','text'}."""
     return cached_read_url(url=url, max_chars=max_chars)
@@ -313,7 +317,7 @@ class RAGRetrieveInput(BaseModel):
     query: str = Field(..., description="The user query to retrieve evidence for.")
     top_k: int = Field(7, ge=1, le=10, description="Top-k chunks to return.")
 
-@tool("rag_retrieve", args_schema=RAGRetrieveInput)
+@lc_tool("rag_retrieve", args_schema=RAGRetrieveInput)
 def rag_retrieve_tool(query: str, top_k: int = 7) -> list[dict]:
     """Retrieve top-k chunks from TutorAI’s curated Gen-AI corpus. Returns [{'title','url','chunk','score'}]."""
     if _global_rag["index"] is None or _global_rag["side"] is None:
@@ -354,6 +358,27 @@ def count_chat_tokens(model_id: str, messages: List[Dict[str, str]], completion_
     return prompt_tokens, completion_tokens
 
 # ============================================================
+#                 Direct HF Fallback (no tools)
+# ============================================================
+def hf_direct_reply(model_id: str, user_text: str, system_text: str = "") -> str:
+    """
+    If the agent fails or returns empty, use a simple HF chat completion so the user always gets an answer.
+    """
+    try:
+        client = InferenceClient(model=model_id, token=HF_TOKEN)
+        msgs = []
+        if system_text:
+            msgs.append({"role": "system", "content": system_text})
+        msgs.append({"role": "user", "content": user_text})
+        resp = client.chat_completion(messages=msgs, max_tokens=512, temperature=0.5, top_p=0.9)
+        choice = resp.choices[0]
+        msg = getattr(choice, "message", None) or choice["message"]
+        content = getattr(msg, "content", None) or msg["content"]
+        return (content or "").strip()
+    except Exception as e:
+        return f"⚠️ Fallback HF error: {e}"
+
+# ============================================================
 #                       Sidebar Settings
 # ============================================================
 with st.sidebar:
@@ -381,8 +406,11 @@ with st.sidebar:
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # ============================================================
-#                Agent Construction (Structured Chat)
+#          Agent Construction (Structured Chat + tools)
 # ============================================================
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
 @st.cache_resource(show_spinner=False)
 def get_agent(model_id: str, use_tools: bool, max_iterations: int):
     endpoint = HuggingFaceEndpoint(
@@ -397,7 +425,6 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
     tools = [rag_retrieve_tool] if not use_tools else [web_search_tool, read_url_tool, rag_retrieve_tool]
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-    # IMPORTANT: include {tools} and {tool_names} for structured-chat agent
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
@@ -417,7 +444,7 @@ def get_agent(model_id: str, use_tools: bool, max_iterations: int):
     executor = AgentExecutor(
         agent=agent,
         tools=tools,
-        verbose=False,
+        verbose=True,                    # 👈 turn on verbose so you see planning/parsing errors in logs/LangSmith
         max_iterations=max_iterations,
         handle_parsing_errors=True,
         return_intermediate_steps=True,
@@ -473,21 +500,41 @@ if user_q:
         with trace("agent_turn", run_type="chain", inputs={"question": user_q}):
             with st.chat_message("assistant"):
                 with st.spinner("Thinking with tools…"):
+                    result = {}
+                    error_text = ""
                     try:
-                        result = agent.invoke(agent_input, config={
-                            "metadata": {"scenario": scenario_name, "model": model_id, "tools_enabled": enable_agent},
-                            "tags": ["TutorAI", "Agentic", "RAG"],
-                            "run_name": "TutorAI-Agentic-Turn",
-                        })
-                        reply = result["output"]
-                        inter = result.get("intermediate_steps", [])
+                        result = agent.invoke(
+                            agent_input,
+                            config={
+                                "metadata": {"scenario": scenario_name, "model": model_id, "tools_enabled": enable_agent},
+                                "tags": ["TutorAI", "Agentic", "RAG"],
+                                "run_name": "TutorAI-Agentic-Turn",
+                            },
+                        )
+                        reply = result.get("output", "")
                     except Exception as e:
-                        reply = f"⚠️ Agent error: {e}"
-                        inter = []
+                        reply = ""
+                        error_text = f"Agent exception: {e}"
+
+                # If the agent produced nothing, do a direct HF fallback so user always sees something
+                if not reply or not reply.strip():
+                    fallback_prompt = (
+                        "Answer clearly. If you used any web content or documents, mention sources.\n\n"
+                        f"Question: {user_q}"
+                    )
+                    reply = hf_direct_reply(model_id, fallback_prompt, system_text=scenario_system)
 
                 st.markdown(reply)
 
+                # Show raw result for debugging if empty or if errors happened
+                if error_text or not result:
+                    with st.expander("⚙️ Debug (raw agent result / errors)"):
+                        if error_text:
+                            st.error(error_text)
+                        st.json(result or {"note": "No result object returned by agent."})
+
                 # Agent trace (tool calls)
+                inter = result.get("intermediate_steps", [])
                 if inter:
                     with st.expander("🔍 Agent Trace (tools & observations)"):
                         for i, (tool_call, observation) in enumerate(inter, start=1):
@@ -497,6 +544,7 @@ if user_q:
                             except Exception:
                                 args_str = str(tool_call.tool_input)
                             st.code(args_str, language="json")
+                            # observation preview
                             obs_view = observation
                             try:
                                 if isinstance(observation, (list, dict)):

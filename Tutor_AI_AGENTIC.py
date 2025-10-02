@@ -1,7 +1,9 @@
 # app.py
 # GenAI-Tutor (Agentic ReAct) — RAG + Tools + LangSmith (HF-only)
-# ReAct agent w/ single-string tools to avoid strict JSON tool-calls.
-# FIX: agent_scratchpad rendered as assistant text (string), not MessagesPlaceholder.
+# Fixes:
+#  - Auto-build RAG index on startup & lazy-build inside rag_retrieve
+#  - web_search: region/lang defaults + fallback rewrite + early-stop messages
+#  - ReAct prompt nudges: avoid infinite loops; synthesize answer after failed tools
 
 import os, io, json, re, hashlib, requests
 from typing import List, Dict, Any, Tuple
@@ -136,11 +138,8 @@ def chunk_text(text: str, url: str, title: str) -> List[Dict[str, Any]]:
         piece = " ".join(words[start:end])
         chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
         chunks.append({"chunk_id":chunk_id,"title":title,"url":url,"text":piece})
-    if not chunks: return chunks
-    # overlap stepping
-    for i in range(len(chunks)-1):
-        pass
-    # we already advanced by slicing word windows; fine for demo
+        if end == len(words): break
+        start = max(0, end-OVERLAP_WORDS); k += 1
     return chunks
 
 @st.cache_resource(show_spinner=True)
@@ -189,7 +188,14 @@ def retrieve(query: str, index, side: Dict[str, Any]) -> List[Dict[str, Any]]:
     for c, rs in zip(candidates, rers): c["score_rerank"] = float(rs)
     return sorted(candidates, key=lambda x: x["score_rerank"], reverse=True)[:TOP_K]
 
+# Global RAG (auto-build at startup)
 _global_rag = {"index": None, "side": None}
+try:
+    idx0, side0 = build_rag_index(DOC_LINKS)
+    _global_rag["index"], _global_rag["side"] = idx0, side0
+except Exception as e:
+    # Don't crash UI; user can press Refresh later. Tools will lazy-build.
+    pass
 
 # -------------------------------
 # Tool helpers: permissive parsing
@@ -217,19 +223,42 @@ def parse_kv(text: str) -> Dict[str, Any]:
 # -------------------------------
 def tool_web_search(inp: str) -> str:
     """web_search(input: str) -> JSON string.
-    Input can be natural language, or JSON with keys: query (str), max_results (int<=10).
-    Returns JSON list of {'title','url','snippet'}.
+    Input can be natural language, or JSON with keys: query (str), max_results (int<=10), region (str), lang (str).
+    Returns JSON list of {'title','url','snippet'} or [{'note': ...}] when nothing useful was found.
     """
-    params = {"query": inp, "max_results": 5}
+    params = {"query": inp, "max_results": 5, "region": "wt-wt", "lang": "en"}
     data = extract_json_block(inp) or parse_kv(inp)
     if "query" in data: params["query"] = data["query"]
     if "max_results" in data:
         try: params["max_results"] = max(1, min(10, int(data["max_results"])))
         except: pass
+    if "region" in data: params["region"] = str(data["region"])
+    if "lang" in data: params["lang"] = str(data["lang"])
+
     results = []
     try:
         with DDGS() as ddg:
-            for r in ddg.text(params["query"], max_results=params["max_results"], safesearch="moderate"):
+            for r in ddg.text(
+                params["query"],
+                max_results=params["max_results"],
+                region=params["region"],
+                safesearch="moderate",
+                timelimit=None,
+                backend="api",
+            ):
+                title = r.get("title") or ""
+                url = r.get("href") or r.get("url") or ""
+                snippet = r.get("body") or ""
+                if title and url:
+                    results.append({"title": title, "url": url, "snippet": snippet})
+        # lightweight fallback: English bias and define*
+        if not results:
+            q2 = params["query"]
+            if "gen ai" in q2.lower() or "genai" in q2.lower():
+                q2 = "what is generative ai definition site:ibm.com OR site:nvidia.com OR site:microsoft.com"
+            else:
+                q2 = params["query"] + " definition"
+            for r in DDGS().text(q2, max_results=params["max_results"], region="wt-wt", safesearch="moderate", backend="api"):
                 title = r.get("title") or ""
                 url = r.get("href") or r.get("url") or ""
                 snippet = r.get("body") or ""
@@ -237,6 +266,9 @@ def tool_web_search(inp: str) -> str:
                     results.append({"title": title, "url": url, "snippet": snippet})
     except Exception as e:
         return json.dumps([{"error": f"web_search failed: {e}"}], ensure_ascii=False)
+
+    if not results:
+        return json.dumps([{"note": "No results found for this query. Consider rephrasing."}], ensure_ascii=False)
     return json.dumps(results, ensure_ascii=False)
 
 def tool_read_url(inp: str) -> str:
@@ -262,24 +294,33 @@ def tool_read_url(inp: str) -> str:
 def tool_rag_retrieve(inp: str) -> str:
     """rag_retrieve(input: str) -> JSON string.
     Input can be natural language or JSON with keys: query (str), top_k (int).
-    Returns JSON list of {'title','url','chunk','score'}.
+    Returns JSON list of {'title','url','chunk','score'} or [{'note': ...}] when index is not ready.
     """
+    # Lazy-build if needed
     if _global_rag["index"] is None or _global_rag["side"] is None:
-        return json.dumps([{"error":"RAG index not initialized. Build it from the sidebar."}], ensure_ascii=False)
+        try:
+            idx, side = build_rag_index(DOC_LINKS)
+            _global_rag["index"], _global_rag["side"] = idx, side
+        except Exception as e:
+            return json.dumps([{"note": f"RAG index unavailable: {e}"}], ensure_ascii=False)
+
     data = extract_json_block(inp) or parse_kv(inp)
     q = data.get("query") or inp.strip()
     try:
         k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
     except:
         k = TOP_K
+
     results = retrieve(q, _global_rag["index"], _global_rag["side"])[:k]
+    if not results:
+        return json.dumps([{"note": "No evidence retrieved from corpus for this query."}], ensure_ascii=False)
     out = [{"title":c["title"],"url":c["url"],"chunk":c["text"][:900],"score":round(float(c.get("score_rerank",0.0)),4)} for c in results]
     return json.dumps(out, ensure_ascii=False)
 
 TOOLS: List[Tool] = [
-    Tool(name="web_search", func=tool_web_search, description="Search the web. Input: natural language or JSON {query, max_results}. Output: JSON list."),
+    Tool(name="web_search", func=tool_web_search, description="Search the web. Input: natural language or JSON {query, max_results, region, lang}. Output: JSON list or [{'note':...}]."),
     Tool(name="read_url", func=tool_read_url, description="Read a URL (HTML/PDF). Input: URL or JSON {url, max_chars}. Output: JSON object."),
-    Tool(name="rag_retrieve", func=tool_rag_retrieve, description="Retrieve from curated Gen-AI corpus. Input: natural language or JSON {query, top_k}. Output: JSON list."),
+    Tool(name="rag_retrieve", func=tool_rag_retrieve, description="Retrieve from curated Gen-AI corpus. Input: natural language or JSON {query, top_k}. Output: JSON list or [{'note':...}]."),
 ]
 
 # -------------------------------
@@ -324,7 +365,7 @@ with st.sidebar:
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # -------------------------------
-# Build ReAct Agent (✅ FIXED PROMPT)
+# Build ReAct Agent (prompt tweaked to avoid loops)
 # -------------------------------
 def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
     endpoint = HuggingFaceEndpoint(
@@ -338,8 +379,6 @@ def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
     llm = ChatHuggingFace(llm=endpoint)
     tools = TOOLS if use_tools else [TOOLS[-1]]  # rag_retrieve only if disabled
 
-    # Include BOTH {tools} and {tool_names}
-    # ✅ FIX: agent_scratchpad as assistant text (string), NOT MessagesPlaceholder
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
@@ -350,10 +389,13 @@ def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
              "Action: one of [{tool_names}] or Final Answer\n"
              "Action Input: <single string>\n"
              "Observation: ...\n"
-             "Repeat as needed. Then give Final Answer with citations if used.\n"),
+             "Repeat as needed.\n"
+             "- If two consecutive tool calls return empty, craft the Final Answer using your knowledge and clearly state limitations.\n"
+             "- Prefer rag_retrieve first; if it returns a note/no evidence, try web_search once; then finalize.\n"
+             "Always cite sources you relied on."),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
-            ("assistant", "{agent_scratchpad}"),  # <— THIS LINE FIXES YOUR ERROR
+            ("assistant", "{agent_scratchpad}"),
         ]
     )
 
@@ -404,7 +446,7 @@ user_q = st.chat_input("Ask a question. The agent may use WebSearch, ReadURL, or
 if user_q:
     st.session_state.messages.append({"role":"user","content":user_q})
     agent = get_react_agent(model_id, enable_agent, max_steps)
-    chat_history = []  # optional; we're rendering full transcript ourselves
+    chat_history = []  # we render transcript ourselves
 
     with tracing_context(project_name=LS_PROJECT, metadata={"type":"agent_turn","scenario":scenario_name,"model":model_id}):
         with trace("agent_turn", run_type="chain", inputs={"question": user_q}):

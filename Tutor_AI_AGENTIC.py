@@ -16,9 +16,9 @@ from huggingface_hub import InferenceClient
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 
-# -------------------------------
+# =========================
 # Streamlit & Secrets
-# -------------------------------
+# =========================
 st.set_page_config(page_title="GenAI-Tutor (Agentic + RAG)", layout="wide")
 st.markdown("<h1>🎓 GenAI-Tutor — Agentic + RAG (HF-only, JSON controller)</h1>", unsafe_allow_html=True)
 
@@ -33,9 +33,9 @@ os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True))
 LS_PROJECT = st.secrets.get("LANGSMITH_PROJECT", os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-Agentic"))
 ls_client = Client()
 
-# -------------------------------
+# =========================
 # Models & Scenarios
-# -------------------------------
+# =========================
 HF_MODELS = [
     "meta-llama/Meta-Llama-3-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.2",
@@ -60,9 +60,9 @@ SCENARIOS: Dict[str, Dict[str, str]] = {
 }
 SCENARIO_NAMES = list(SCENARIOS.keys())
 
-# -------------------------------
+# =========================
 # RAG corpus (public)
-# -------------------------------
+# =========================
 DOC_LINKS = [
     {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
      "url": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2025.1565938/full", "enabled": True},
@@ -76,9 +76,9 @@ DOC_LINKS = [
      "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
 ]
 
-# -------------------------------
+# =========================
 # RAG plumbing
-# -------------------------------
+# =========================
 TOP_K = 7
 K_CANDIDATES = 30
 WORDS_PER_CHUNK = 450
@@ -185,24 +185,26 @@ try:
 except Exception:
     pass
 
-# -------------------------------
+# =========================
 # Tool helpers & tools
-# -------------------------------
+# =========================
 def _extract_json_block(text: str) -> Dict[str, Any]:
     # Return the first {...} JSON object in text, if any
     try:
-        m = re.search(r"\{(?:[^{}]|(?R))*\}", text, flags=re.S)  # balanced-ish
-    except re.error:
+        # fallback-safe: unbalanced but practical
         m = re.search(r"\{.*\}", text, flags=re.S)
+    except re.error:
+        m = None
     if not m:
         return {}
+    s = m.group(0)
     try:
-        return json.loads(m.group(0))
+        return json.loads(s)
     except Exception:
-        # last-ditch: remove trailing commas
-        s = re.sub(r",\s*([}\]])", r"\1", m.group(0))
+        # try removing trailing commas
+        s2 = re.sub(r",\s*([}\]])", r"\1", s)
         try:
-            return json.loads(s)
+            return json.loads(s2)
         except Exception:
             return {}
 
@@ -221,36 +223,24 @@ def web_search(query: str, max_results: int = 5, region: str = "wt-wt", lang: st
     return results
 
 def tool_web_search(inp: str) -> Dict[str, Any]:
-    # Parse optional JSON or kv; fallback to raw string
-    try:
-        data = _extract_json_block(inp)
-        if not data:
-            # parse simple key=val
-            data = {}
-            for part in re.split(r"[,\n;]\s*|\s{2,}", inp):
-                if "=" in part:
-                    k,v = part.split("=",1); data[k.strip()] = v.strip()
-    except Exception:
-        data = {}
+    """Search the web. Input: natural language or JSON {query,max_results,region,lang}. Output: {'results': [...]} or {'note': ...}"""
+    data = _extract_json_block(inp) or {}
     query = data.get("query") or inp.strip()
     max_results = int(data.get("max_results", 5)) if str(data.get("max_results","")).isdigit() else 5
     region = data.get("region","wt-wt"); lang = data.get("lang","en")
 
     res = web_search(query, max_results=max_results, region=region, lang=lang)
     if not res:
-        # tiny rewrite for common cases
         if "gen ai" in query.lower() or "genai" in query.lower():
             query2 = "what is generative ai definition site:ibm.com OR site:nvidia.com OR site:microsoft.com"
         else:
             query2 = query + " definition"
         res = web_search(query2, max_results=max_results, region="wt-wt", lang="en")
-    return {"results": res}
+    return {"results": res} if res else {"note": "No results found. Consider rephrasing the query."}
 
 def tool_read_url(inp: str) -> Dict[str, Any]:
-    try:
-        data = _extract_json_block(inp) or {}
-    except Exception:
-        data = {}
+    """Read a URL (HTML or PDF). Input: URL or JSON {url,max_chars}. Output: {'title','url','text'}"""
+    data = _extract_json_block(inp) or {}
     url = data.get("url") or inp.strip()
     max_chars = int(data.get("max_chars", 6000)) if str(data.get("max_chars","")).isdigit() else 6000
     try:
@@ -268,14 +258,12 @@ def ensure_rag_ready():
         _global_rag["index"], _global_rag["side"] = idx, side
 
 def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
+    """Retrieve from curated Gen-AI corpus. Input: natural text or JSON {query,top_k}. Output: {'results': [...]} or {'note': ...}"""
     try:
         ensure_rag_ready()
     except Exception as e:
         return {"note": f"RAG index unavailable: {e}"}
-    try:
-        data = _extract_json_block(inp) or {}
-    except Exception:
-        data = {}
+    data = _extract_json_block(inp) or {}
     q = data.get("query") or inp.strip()
     try:
         k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
@@ -293,9 +281,9 @@ TOOLS = {
     "read_url": tool_read_url,
 }
 
-# -------------------------------
-# HF chat wrapper (JSON controller)
-# -------------------------------
+# =========================
+# HF chat wrapper
+# =========================
 def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, temperature=0.3, top_p=0.9) -> str:
     client = InferenceClient(model=model, token=HF_TOKEN)
     resp = client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, top_p=top_p)
@@ -304,6 +292,9 @@ def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, tempe
     content = getattr(msg, "content", None) or msg["content"]
     return (content or "").strip()
 
+# =========================
+# JSON Controller System Prompt (FIXED)
+# =========================
 CONTROLLER_SYSTEM = (
     "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
     "You can call tools or produce a final answer.\n"
@@ -312,7 +303,7 @@ CONTROLLER_SYSTEM = (
     "1) To call a tool:\n"
     '{  "tool": "rag_retrieve" | "web_search" | "read_url",  "input": "<single string>" }\n'
     "2) To finalize:\n"
-    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."}, ... ] }'\n\n"
+    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."} ] }\n\n'
     "Notes:\n"
     "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
     "- Prefer rag_retrieve for Gen-AI learning topics; then at most one web_search.\n"
@@ -328,32 +319,26 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
     citations_pool: List[Dict[str,str]] = []
     empty_hits = 0
 
-    # Controller messages (system + running transcript of JSON I/O)
     controller_msgs = [{"role":"system","content": CONTROLLER_SYSTEM}]
     controller_msgs.append({"role":"user","content": f"User question: {user_input}"})
 
     for step in range(1, max_steps+1):
         with trace("controller_step", run_type="chain", inputs={"step": step}):
-            # Ask the model for the next JSON command
             raw = hf_chat(model_id, controller_msgs, max_new_tokens=256, temperature=0.2, top_p=0.9)
             steps.append({"role":"assistant", "content": raw})
             parsed = _extract_json_block(raw)
 
             if not parsed:
-                # If the model failed to output JSON, force finalize fallback
                 final = hf_chat(model_id, [
                     {"role":"system","content":"Answer the user's question clearly and concisely, without tools."},
                     {"role":"user","content": user_input}
                 ], max_new_tokens=512, temperature=0.3)
                 return final, steps
 
-            # Finalize case
             if "final_answer" in parsed:
                 ans = parsed.get("final_answer","").strip()
                 cites = parsed.get("citations",[])
-                # If model forgot citations, attach from pool
                 if not cites and citations_pool:
-                    # take max 5 unique urls
                     seen=set(); dedup=[]
                     for c in citations_pool:
                         if c.get("url") and c["url"] not in seen:
@@ -364,11 +349,9 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
                     ans += "\n\n**Sources:**\n" + "\n".join([f"- [{c.get('title','source')}]({c['url']})" for c in cites if c.get("url")])
                 return ans, steps
 
-            # Tool call case
             tool = parsed.get("tool")
             tool_inp = parsed.get("input","")
             if tool not in TOOLS:
-                # invalid tool → encourage finalize next
                 empty_hits += 1
                 controller_msgs.append({"role":"assistant","content": raw})
                 controller_msgs.append({"role":"user","content": json.dumps({"note": f"Invalid tool '{tool}'. Consider finalizing."})})
@@ -384,11 +367,10 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
             except Exception as e:
                 result = {"error": f"{tool} failed: {e}"}
 
-            # Observation string for controller
             obs_str = json.dumps(result, ensure_ascii=False)
             steps.append({"role":"tool", "tool": tool, "content": _summarize_text_for_obs(obs_str)})
 
-            # Source pooling for citations
+            # pool citations
             try:
                 if tool == "rag_retrieve":
                     for r in result.get("results", []):
@@ -401,21 +383,20 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
             except Exception:
                 pass
 
-            # Count empty/weak tool returns
+            # track empties
             if (isinstance(result, dict) and not result.get("results")) and ("note" in result or "error" in result or "text" not in result):
                 empty_hits += 1
             else:
                 empty_hits = 0
 
-            # Feed observation back
+            # feedback to controller
             controller_msgs.append({"role":"assistant","content": raw})
             controller_msgs.append({"role":"user","content": f"Observation:\n{_summarize_text_for_obs(obs_str)}\n\nReturn the next JSON. If sufficient, finalize."})
 
             if empty_hits >= 2:
-                # Force finalize
                 break
 
-    # If loop ended without explicit finalize → finalize with best effort
+    # Force finalize if loop exits without explicit final
     final = hf_chat(model_id, [
         {"role":"system","content":"Answer the user's question clearly and concisely. If sources exist, cite them."},
         {"role":"user","content": user_input}
@@ -429,12 +410,12 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
         final += "\n\n**Sources:**\n" + "\n".join([f"- [{c.get('title','source')}]({c['url']})" for c in dedup])
     return final, steps
 
-# -------------------------------
+# =========================
 # Sidebar
-# -------------------------------
+# =========================
 with st.sidebar:
     st.header("⚙️ Settings")
-    scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
+    scenario_name = st.selectbox("Learning Scenario", SCENARIOS.keys(), index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
     max_steps = st.slider("Max tool calls per turn", 1, 10, 6)
     st.markdown("---")
@@ -452,9 +433,9 @@ with st.sidebar:
         st.caption("Uses curated sources; top-k=7 with reranking.")
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
-# -------------------------------
+# =========================
 # Chat State & UI
-# -------------------------------
+# =========================
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role":"system","content":SCENARIOS[scenario_name]["system"]},
@@ -503,15 +484,15 @@ if user_q:
 
     st.session_state.messages.append({"role":"assistant","content":answer})
 
-# -------------------------------
+# =========================
 # Scenario Overview
-# -------------------------------
+# =========================
 st.markdown("---")
 st.subheader("📌 Scenario Overview")
 st.markdown(f"**{scenario_name}**  \n{SCENARIOS[scenario_name]['overview']}")
 
-# -------------------------------
+# =========================
 # Footer
-# -------------------------------
+# =========================
 st.markdown("---")
 st.caption("GenAI-Tutor is educational. Verify critical info. Follow your organization’s policies.")

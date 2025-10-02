@@ -1,11 +1,7 @@
 # app.py
-# GenAI-Tutor (Agentic ReAct) — RAG + Tools + LangSmith (HF-only)
-# Fixes:
-#  - Auto-build RAG index on startup & lazy-build inside rag_retrieve
-#  - web_search: region/lang defaults + fallback rewrite + early-stop messages
-#  - ReAct prompt nudges: avoid infinite loops; synthesize answer after failed tools
+# GenAI-Tutor — Agentic (Custom JSON Controller) + RAG + Tools + LangSmith (HF-only)
 
-import os, io, json, re, hashlib, requests
+import os, io, json, re, hashlib, requests, time
 from typing import List, Dict, Any, Tuple
 
 import numpy as np
@@ -15,23 +11,16 @@ from pypdf import PdfReader
 from duckduckgo_search import DDGS
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient
-from transformers import AutoTokenizer
 
 # LangSmith
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 
-# LangChain (ReAct agent + tools + prompt)
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.tools import Tool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
 # -------------------------------
 # Streamlit & Secrets
 # -------------------------------
-st.set_page_config(page_title="GenAI-Tutor (Agentic ReAct)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Agentic ReAct (RAG + Tools + LangSmith)</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor (Agentic + RAG)", layout="wide")
+st.markdown("<h1>🎓 GenAI-Tutor — Agentic + RAG (HF-only, JSON controller)</h1>", unsafe_allow_html=True)
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -188,157 +177,257 @@ def retrieve(query: str, index, side: Dict[str, Any]) -> List[Dict[str, Any]]:
     for c, rs in zip(candidates, rers): c["score_rerank"] = float(rs)
     return sorted(candidates, key=lambda x: x["score_rerank"], reverse=True)[:TOP_K]
 
-# Global RAG (auto-build at startup)
+# Global RAG (auto-build at startup; non-fatal)
 _global_rag = {"index": None, "side": None}
 try:
     idx0, side0 = build_rag_index(DOC_LINKS)
     _global_rag["index"], _global_rag["side"] = idx0, side0
-except Exception as e:
-    # Don't crash UI; user can press Refresh later. Tools will lazy-build.
+except Exception:
     pass
 
 # -------------------------------
-# Tool helpers: permissive parsing
+# Tool helpers & tools
 # -------------------------------
-def extract_json_block(text: str) -> Dict[str, Any]:
+def _extract_json_block(text: str) -> Dict[str, Any]:
+    # Return the first {...} JSON object in text, if any
     try:
+        m = re.search(r"\{(?:[^{}]|(?R))*\}", text, flags=re.S)  # balanced-ish
+    except re.error:
         m = re.search(r"\{.*\}", text, flags=re.S)
-        if m: return json.loads(m.group(0))
-    except Exception:
-        pass
-    return {}
-
-def parse_kv(text: str) -> Dict[str, Any]:
-    out = {}
-    for part in re.split(r"[,\n;]\s*|\s{2,}", text):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if v.isdigit(): v = int(v)
-            out[k] = v
-    return out
-
-# -------------------------------
-# Tools: single-string ReAct style
-# -------------------------------
-def tool_web_search(inp: str) -> str:
-    """web_search(input: str) -> JSON string.
-    Input can be natural language, or JSON with keys: query (str), max_results (int<=10), region (str), lang (str).
-    Returns JSON list of {'title','url','snippet'} or [{'note': ...}] when nothing useful was found.
-    """
-    params = {"query": inp, "max_results": 5, "region": "wt-wt", "lang": "en"}
-    data = extract_json_block(inp) or parse_kv(inp)
-    if "query" in data: params["query"] = data["query"]
-    if "max_results" in data:
-        try: params["max_results"] = max(1, min(10, int(data["max_results"])))
-        except: pass
-    if "region" in data: params["region"] = str(data["region"])
-    if "lang" in data: params["lang"] = str(data["lang"])
-
-    results = []
+    if not m:
+        return {}
     try:
-        with DDGS() as ddg:
-            for r in ddg.text(
-                params["query"],
-                max_results=params["max_results"],
-                region=params["region"],
-                safesearch="moderate",
-                timelimit=None,
-                backend="api",
-            ):
-                title = r.get("title") or ""
-                url = r.get("href") or r.get("url") or ""
-                snippet = r.get("body") or ""
-                if title and url:
-                    results.append({"title": title, "url": url, "snippet": snippet})
-        # lightweight fallback: English bias and define*
-        if not results:
-            q2 = params["query"]
-            if "gen ai" in q2.lower() or "genai" in q2.lower():
-                q2 = "what is generative ai definition site:ibm.com OR site:nvidia.com OR site:microsoft.com"
-            else:
-                q2 = params["query"] + " definition"
-            for r in DDGS().text(q2, max_results=params["max_results"], region="wt-wt", safesearch="moderate", backend="api"):
-                title = r.get("title") or ""
-                url = r.get("href") or r.get("url") or ""
-                snippet = r.get("body") or ""
-                if title and url:
-                    results.append({"title": title, "url": url, "snippet": snippet})
-    except Exception as e:
-        return json.dumps([{"error": f"web_search failed: {e}"}], ensure_ascii=False)
+        return json.loads(m.group(0))
+    except Exception:
+        # last-ditch: remove trailing commas
+        s = re.sub(r",\s*([}\]])", r"\1", m.group(0))
+        try:
+            return json.loads(s)
+        except Exception:
+            return {}
 
-    if not results:
-        return json.dumps([{"note": "No results found for this query. Consider rephrasing."}], ensure_ascii=False)
-    return json.dumps(results, ensure_ascii=False)
+def _summarize_text_for_obs(s: str, limit: int = 1200) -> str:
+    return s[:limit] + ("…" if len(s) > limit else "")
 
-def tool_read_url(inp: str) -> str:
-    """read_url(input: str) -> JSON string.
-    Input can be the URL itself, or JSON with keys: url (str), max_chars (int).
-    Returns {'title','url','text'}.
-    """
-    data = extract_json_block(inp) or parse_kv(inp)
+def web_search(query: str, max_results: int = 5, region: str = "wt-wt", lang: str = "en") -> List[Dict[str, str]]:
+    results = []
+    with DDGS() as ddg:
+        for r in ddg.text(query, max_results=max_results, region=region, safesearch="moderate", backend="api"):
+            title = r.get("title") or ""
+            url = r.get("href") or r.get("url") or ""
+            snippet = r.get("body") or ""
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet})
+    return results
+
+def tool_web_search(inp: str) -> Dict[str, Any]:
+    # Parse optional JSON or kv; fallback to raw string
+    try:
+        data = _extract_json_block(inp)
+        if not data:
+            # parse simple key=val
+            data = {}
+            for part in re.split(r"[,\n;]\s*|\s{2,}", inp):
+                if "=" in part:
+                    k,v = part.split("=",1); data[k.strip()] = v.strip()
+    except Exception:
+        data = {}
+    query = data.get("query") or inp.strip()
+    max_results = int(data.get("max_results", 5)) if str(data.get("max_results","")).isdigit() else 5
+    region = data.get("region","wt-wt"); lang = data.get("lang","en")
+
+    res = web_search(query, max_results=max_results, region=region, lang=lang)
+    if not res:
+        # tiny rewrite for common cases
+        if "gen ai" in query.lower() or "genai" in query.lower():
+            query2 = "what is generative ai definition site:ibm.com OR site:nvidia.com OR site:microsoft.com"
+        else:
+            query2 = query + " definition"
+        res = web_search(query2, max_results=max_results, region="wt-wt", lang="en")
+    return {"results": res}
+
+def tool_read_url(inp: str) -> Dict[str, Any]:
+    try:
+        data = _extract_json_block(inp) or {}
+    except Exception:
+        data = {}
     url = data.get("url") or inp.strip()
     max_chars = int(data.get("max_chars", 6000)) if str(data.get("max_chars","")).isdigit() else 6000
     try:
-        resp = requests.get(url, headers={"User-Agent": "TutorAI/1.0"}, timeout=25)
-        resp.raise_for_status()
-        ctype = (resp.headers.get("Content-Type","")).lower()
-        if "pdf" in ctype or url.lower().endswith(".pdf"):
-            text = _clean_pdf(resp.content)
-        else:
-            text = _clean_html(resp.content)
-        return json.dumps({"title": url, "url": url, "text": (text or "")[:max_chars]}, ensure_ascii=False)
+        r = requests.get(url, headers={"User-Agent":"TutorAI/1.0"}, timeout=25)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type","")).lower()
+        text = _clean_pdf(r.content) if ("pdf" in ctype or url.lower().endswith(".pdf")) else _clean_html(r.content)
+        return {"title": url, "url": url, "text": text[:max_chars]}
     except Exception as e:
-        return json.dumps({"title": url, "url": url, "text": f"[Error: {e}]"}, ensure_ascii=False)
+        return {"title": url, "url": url, "text": f"[Error: {e}]"}
 
-def tool_rag_retrieve(inp: str) -> str:
-    """rag_retrieve(input: str) -> JSON string.
-    Input can be natural language or JSON with keys: query (str), top_k (int).
-    Returns JSON list of {'title','url','chunk','score'} or [{'note': ...}] when index is not ready.
-    """
-    # Lazy-build if needed
+def ensure_rag_ready():
     if _global_rag["index"] is None or _global_rag["side"] is None:
-        try:
-            idx, side = build_rag_index(DOC_LINKS)
-            _global_rag["index"], _global_rag["side"] = idx, side
-        except Exception as e:
-            return json.dumps([{"note": f"RAG index unavailable: {e}"}], ensure_ascii=False)
+        idx, side = build_rag_index(DOC_LINKS)
+        _global_rag["index"], _global_rag["side"] = idx, side
 
-    data = extract_json_block(inp) or parse_kv(inp)
+def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
+    try:
+        ensure_rag_ready()
+    except Exception as e:
+        return {"note": f"RAG index unavailable: {e}"}
+    try:
+        data = _extract_json_block(inp) or {}
+    except Exception:
+        data = {}
     q = data.get("query") or inp.strip()
     try:
         k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
     except:
         k = TOP_K
-
     results = retrieve(q, _global_rag["index"], _global_rag["side"])[:k]
     if not results:
-        return json.dumps([{"note": "No evidence retrieved from corpus for this query."}], ensure_ascii=False)
-    out = [{"title":c["title"],"url":c["url"],"chunk":c["text"][:900],"score":round(float(c.get("score_rerank",0.0)),4)} for c in results]
-    return json.dumps(out, ensure_ascii=False)
+        return {"note":"No evidence retrieved from corpus for this query."}
+    out = [{"title":c["title"], "url":c["url"], "chunk":c["text"][:900], "score":float(c.get("score_rerank",0.0))} for c in results]
+    return {"results": out}
 
-TOOLS: List[Tool] = [
-    Tool(name="web_search", func=tool_web_search, description="Search the web. Input: natural language or JSON {query, max_results, region, lang}. Output: JSON list or [{'note':...}]."),
-    Tool(name="read_url", func=tool_read_url, description="Read a URL (HTML/PDF). Input: URL or JSON {url, max_chars}. Output: JSON object."),
-    Tool(name="rag_retrieve", func=tool_rag_retrieve, description="Retrieve from curated Gen-AI corpus. Input: natural language or JSON {query, top_k}. Output: JSON list or [{'note':...}]."),
-]
+TOOLS = {
+    "rag_retrieve": tool_rag_retrieve,
+    "web_search": tool_web_search,
+    "read_url": tool_read_url,
+}
 
 # -------------------------------
-# HF Fallback (no tools)
+# HF chat wrapper (JSON controller)
 # -------------------------------
-def hf_direct_reply(model_id: str, user_text: str, system_text: str = "") -> str:
-    try:
-        client = InferenceClient(model=model_id, token=HF_TOKEN)
-        msgs = []
-        if system_text: msgs.append({"role":"system","content":system_text})
-        msgs.append({"role":"user","content":user_text})
-        resp = client.chat_completion(messages=msgs, max_tokens=512, temperature=0.4, top_p=0.9)
-        choice = resp.choices[0]
-        msg = getattr(choice,"message",None) or choice["message"]
-        content = getattr(msg,"content",None) or msg["content"]
-        return (content or "").strip()
-    except Exception as e:
-        return f"⚠️ Fallback HF error: {e}"
+def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, temperature=0.3, top_p=0.9) -> str:
+    client = InferenceClient(model=model, token=HF_TOKEN)
+    resp = client.chat_completion(messages=messages, max_tokens=max_new_tokens, temperature=temperature, top_p=top_p)
+    choice = resp.choices[0]
+    msg = getattr(choice, "message", None) or choice["message"]
+    content = getattr(msg, "content", None) or msg["content"]
+    return (content or "").strip()
+
+CONTROLLER_SYSTEM = (
+    "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
+    "You can call tools or produce a final answer.\n"
+    "Available tools (call names exactly): rag_retrieve, web_search, read_url.\n\n"
+    "RETURN FORMAT (MUST be a single JSON object, no trailing text):\n"
+    "1) To call a tool:\n"
+    '{  "tool": "rag_retrieve" | "web_search" | "read_url",  "input": "<single string>" }\n'
+    "2) To finalize:\n"
+    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."}, ... ] }\n\n"
+    "Notes:\n"
+    "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
+    "- Prefer rag_retrieve for Gen-AI learning topics; then at most one web_search.\n"
+    "- Cite sources you relied on. Keep answers concise and factual.\n"
+)
+
+def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Returns (final_answer, trace_steps)
+    trace_steps: list of {role, content} and tool observations for debug panel.
+    """
+    steps = []
+    citations_pool: List[Dict[str,str]] = []
+    empty_hits = 0
+
+    # Controller messages (system + running transcript of JSON I/O)
+    controller_msgs = [{"role":"system","content": CONTROLLER_SYSTEM}]
+    controller_msgs.append({"role":"user","content": f"User question: {user_input}"})
+
+    for step in range(1, max_steps+1):
+        with trace("controller_step", run_type="chain", inputs={"step": step}):
+            # Ask the model for the next JSON command
+            raw = hf_chat(model_id, controller_msgs, max_new_tokens=256, temperature=0.2, top_p=0.9)
+            steps.append({"role":"assistant", "content": raw})
+            parsed = _extract_json_block(raw)
+
+            if not parsed:
+                # If the model failed to output JSON, force finalize fallback
+                final = hf_chat(model_id, [
+                    {"role":"system","content":"Answer the user's question clearly and concisely, without tools."},
+                    {"role":"user","content": user_input}
+                ], max_new_tokens=512, temperature=0.3)
+                return final, steps
+
+            # Finalize case
+            if "final_answer" in parsed:
+                ans = parsed.get("final_answer","").strip()
+                cites = parsed.get("citations",[])
+                # If model forgot citations, attach from pool
+                if not cites and citations_pool:
+                    # take max 5 unique urls
+                    seen=set(); dedup=[]
+                    for c in citations_pool:
+                        if c.get("url") and c["url"] not in seen:
+                            dedup.append(c); seen.add(c["url"])
+                        if len(dedup) >= 5: break
+                    cites = dedup
+                if cites:
+                    ans += "\n\n**Sources:**\n" + "\n".join([f"- [{c.get('title','source')}]({c['url']})" for c in cites if c.get("url")])
+                return ans, steps
+
+            # Tool call case
+            tool = parsed.get("tool")
+            tool_inp = parsed.get("input","")
+            if tool not in TOOLS:
+                # invalid tool → encourage finalize next
+                empty_hits += 1
+                controller_msgs.append({"role":"assistant","content": raw})
+                controller_msgs.append({"role":"user","content": json.dumps({"note": f"Invalid tool '{tool}'. Consider finalizing."})})
+                if empty_hits >= 2:
+                    break
+                continue
+
+            # Execute tool
+            try:
+                with trace(f"tool:{tool}", run_type="tool", inputs={"input": tool_inp}) as tspan:
+                    result = TOOLS[tool](tool_inp)
+                    tspan.outputs = {"result": result}
+            except Exception as e:
+                result = {"error": f"{tool} failed: {e}"}
+
+            # Observation string for controller
+            obs_str = json.dumps(result, ensure_ascii=False)
+            steps.append({"role":"tool", "tool": tool, "content": _summarize_text_for_obs(obs_str)})
+
+            # Source pooling for citations
+            try:
+                if tool == "rag_retrieve":
+                    for r in result.get("results", []):
+                        citations_pool.append({"title": r.get("title","source"), "url": r.get("url","")})
+                elif tool == "web_search":
+                    for r in result.get("results", []):
+                        citations_pool.append({"title": r.get("title","source"), "url": r.get("url","")})
+                elif tool == "read_url":
+                    citations_pool.append({"title": result.get("title","source"), "url": result.get("url","")})
+            except Exception:
+                pass
+
+            # Count empty/weak tool returns
+            if (isinstance(result, dict) and not result.get("results")) and ("note" in result or "error" in result or "text" not in result):
+                empty_hits += 1
+            else:
+                empty_hits = 0
+
+            # Feed observation back
+            controller_msgs.append({"role":"assistant","content": raw})
+            controller_msgs.append({"role":"user","content": f"Observation:\n{_summarize_text_for_obs(obs_str)}\n\nReturn the next JSON. If sufficient, finalize."})
+
+            if empty_hits >= 2:
+                # Force finalize
+                break
+
+    # If loop ended without explicit finalize → finalize with best effort
+    final = hf_chat(model_id, [
+        {"role":"system","content":"Answer the user's question clearly and concisely. If sources exist, cite them."},
+        {"role":"user","content": user_input}
+    ], max_new_tokens=512, temperature=0.3)
+    if citations_pool:
+        seen=set(); dedup=[]
+        for c in citations_pool:
+            if c.get("url") and c["url"] not in seen:
+                dedup.append(c); seen.add(c["url"])
+            if len(dedup) >= 5: break
+        final += "\n\n**Sources:**\n" + "\n".join([f"- [{c.get('title','source')}]({c['url']})" for c in dedup])
+    return final, steps
 
 # -------------------------------
 # Sidebar
@@ -347,7 +436,6 @@ with st.sidebar:
     st.header("⚙️ Settings")
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
-    enable_agent = st.checkbox("Enable Tools (Agentic)", value=True)
     max_steps = st.slider("Max tool calls per turn", 1, 10, 6)
     st.markdown("---")
     st.subheader("📚 RAG Corpus")
@@ -365,53 +453,7 @@ with st.sidebar:
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # -------------------------------
-# Build ReAct Agent (prompt tweaked to avoid loops)
-# -------------------------------
-def get_react_agent(model_id: str, use_tools: bool, max_iterations: int):
-    endpoint = HuggingFaceEndpoint(
-        repo_id=model_id,
-        task="text-generation",
-        huggingfacehub_api_token=HF_TOKEN,
-        max_new_tokens=512,
-        temperature=0.3,
-        top_p=0.9,
-    )
-    llm = ChatHuggingFace(llm=endpoint)
-    tools = TOOLS if use_tools else [TOOLS[-1]]  # rag_retrieve only if disabled
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system",
-             "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
-             "TOOLS:\n{tools}\n\n"
-             "Use the ReAct format exactly:\n"
-             "Thought: ...\n"
-             "Action: one of [{tool_names}] or Final Answer\n"
-             "Action Input: <single string>\n"
-             "Observation: ...\n"
-             "Repeat as needed.\n"
-             "- If two consecutive tool calls return empty, craft the Final Answer using your knowledge and clearly state limitations.\n"
-             "- Prefer rag_retrieve first; if it returns a note/no evidence, try web_search once; then finalize.\n"
-             "Always cite sources you relied on."),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-            ("assistant", "{agent_scratchpad}"),
-        ]
-    )
-
-    agent = create_react_agent(llm=llm, tools=tools, prompt=prompt)
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        max_iterations=max_iterations,
-        handle_parsing_errors=True,
-        return_intermediate_steps=True,
-    )
-    return executor
-
-# -------------------------------
-# Chat State
+# Chat State & UI
 # -------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -427,79 +469,39 @@ def _seed_chat():
         {"role":"assistant","content":"Hi! I’m GenAI-Tutor. Ask me anything about Gen-AI."}
     ]
 if st.session_state.scenario_prev != scenario_name:
-    _seed_chat()
-    st.session_state.scenario_prev = scenario_name
+    _seed_chat(); st.session_state.scenario_prev = scenario_name
 
-# -------------------------------
-# Render history
-# -------------------------------
 st.markdown("---")
-st.subheader("💬 Tutor Chat (Agentic ReAct)")
+st.subheader("💬 Tutor Chat (Agentic JSON)")
+
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
         st.markdown(m["content"])
 
-# -------------------------------
-# Handle user prompt
-# -------------------------------
-user_q = st.chat_input("Ask a question. The agent may use WebSearch, ReadURL, or RAG…")
+user_q = st.chat_input("Ask a question. The agent may use RAG, WebSearch, ReadURL…")
 if user_q:
     st.session_state.messages.append({"role":"user","content":user_q})
-    agent = get_react_agent(model_id, enable_agent, max_steps)
-    chat_history = []  # we render transcript ourselves
-
     with tracing_context(project_name=LS_PROJECT, metadata={"type":"agent_turn","scenario":scenario_name,"model":model_id}):
         with trace("agent_turn", run_type="chain", inputs={"question": user_q}):
             with st.chat_message("assistant"):
                 with st.spinner("Thinking with tools…"):
-                    result = {}
-                    error_text = ""
                     try:
-                        result = agent.invoke(
-                            {"input": user_q, "chat_history": chat_history},
-                            config={"metadata":{"scenario": scenario_name, "model": model_id},
-                                    "tags":["TutorAI","Agentic","ReAct"], "run_name":"TutorAI-ReAct-Turn"},
-                        )
-                        reply = result.get("output","")
+                        answer, step_trace = run_agent(user_q, model_id, max_steps=max_steps)
                     except Exception as e:
-                        reply = ""
-                        error_text = f"Agent exception: {e}"
+                        answer, step_trace = f"⚠️ Agent failed: {e}", []
 
-                if not reply.strip():
-                    reply = hf_direct_reply(model_id, f"{SCENARIOS[scenario_name]['system']}\n\nUser question: {user_q}")
+                st.markdown(answer)
+                if step_trace:
+                    with st.expander("🔍 Agent Trace (JSON + Observations)"):
+                        for i, step in enumerate(step_trace, start=1):
+                            if step.get("role") == "assistant":
+                                st.markdown(f"**Step {i}: Controller JSON**")
+                                st.code(step["content"], language="json")
+                            elif step.get("role") == "tool":
+                                st.markdown(f"**Step {i}: Tool `{step.get('tool')}` observation**")
+                                st.text_area("Observation", value=step["content"], height=160, key=f"obs_{i}_{step.get('tool')}")
 
-                st.markdown(reply or "No reply.")
-
-                # Debug / result inspector
-                inter = result.get("intermediate_steps", [])
-                if error_text or not result or inter is None:
-                    with st.expander("⚙️ Debug (raw agent result / errors)"):
-                        if error_text: st.error(error_text)
-                        st.json(result or {"note":"No result from agent."})
-
-                if inter:
-                    with st.expander("🔍 Agent Trace (ReAct steps)"):
-                        for i, (tool_invocation, observation) in enumerate(inter, start=1):
-                            tool_name = getattr(tool_invocation, "tool", "_unknown")
-                            st.markdown(f"**Step {i}: `{tool_name}`**")
-                            try:
-                                args_str = json.dumps(tool_invocation.tool_input, ensure_ascii=False)
-                            except Exception:
-                                args_str = str(tool_invocation.tool_input)
-                            st.code(args_str, language="json")
-                            obs_view = observation
-                            try:
-                                if isinstance(observation, (list, dict)):
-                                    obs_view = json.dumps(observation, ensure_ascii=False)[:1200]
-                                elif isinstance(observation, str):
-                                    obs_view = observation[:1200]
-                                else:
-                                    obs_view = str(observation)[:1200]
-                            except Exception:
-                                obs_view = str(observation)[:1200]
-                            st.text_area("Observation", value=obs_view, height=160, key=f"obs_{i}_{tool_name}")
-
-            st.session_state.messages.append({"role":"assistant","content":reply})
+    st.session_state.messages.append({"role":"assistant","content":answer})
 
 # -------------------------------
 # Scenario Overview

@@ -1,25 +1,35 @@
-# GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith (Hardened, LC web tool, no hardcoding)
+# GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith
+# (Hardened, LC DuckDuckGo search, no hardcoding, health-check logs silenced)
 
-import os, io, re, json, hashlib, requests, time
+import os, io, re, json, hashlib, requests, time, logging
 from typing import List, Dict, Any, Tuple, Optional
 
 # --- Disable Streamlit file watcher early (fixes inotify limits) ---
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+# Optional: reduce misc telemetry
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+
+# Silence Tornado access logs (hides GET /script-health-check spam)
+for _name in ("tornado.access", "tornado.application", "tornado.general"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
 
 import numpy as np
 import streamlit as st
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-# NOTE: ddgs removed; we now use LangChain's DuckDuckGo tool
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from huggingface_hub import InferenceClient, InferenceTimeoutError, BadRequestError
+from huggingface_hub import InferenceClient
+from requests.exceptions import HTTPError, RequestException
+try:
+    from huggingface_hub import InferenceTimeoutError as HFTimeout  # optional if available
+except Exception:
+    HFTimeout = None
 
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace
 
 # LangChain DuckDuckGo (free) for web search
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
-from langchain.tools import Tool  # optional, kept for future LC/LangGraph use
 
 # =========================
 # Streamlit & Secrets
@@ -94,7 +104,7 @@ TOP_K = 7
 K_CANDIDATES = 30
 WORDS_PER_CHUNK = 450
 OVERLAP_WORDS = 80
-MIN_RERANK_SCORE = 0.05  # more permissive
+MIN_RERANK_SCORE = 0.05  # permissive
 
 @st.cache_data(show_spinner=False)
 def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
@@ -196,9 +206,6 @@ def build_rag_index(doc_links: List[Dict[str, Any]]):
     return index, side
 
 def retrieve(query: str, index, side: Dict[str, Any], top_k: int = TOP_K) -> Tuple[List[Dict[str, Any]], float]:
-    """
-    Returns (results, avg_score). avg_score helps planner assess quality.
-    """
     embedder, reranker = load_embedder(), load_reranker()
     qv = embed_texts([query], embedder)
     scores, idxs = index.search(qv, K_CANDIDATES)
@@ -246,6 +253,7 @@ def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
     if not query or len(query.strip()) < 3:
         return []
     wrapper = DuckDuckGoSearchAPIWrapper(region="us-en", time="y", max_results=max_results)
+
     def _once(q: str) -> List[Dict[str, str]]:
         items = wrapper.results(q, max_results=max_results) or []
         out = []
@@ -256,6 +264,7 @@ def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
             if title and url:
                 out.append({"title": title[:160], "url": url, "snippet": snippet[:400]})
         return out
+
     try:
         res = _once(query)
     except Exception:
@@ -442,15 +451,9 @@ Tool selection strategy:
 """
 
 # =========================
-# HF chat wrapper (kept, but hardened)
+# HF chat wrapper (kept structure, hardened)
 # =========================
 def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, temperature=0.0, top_p=0.9) -> str:
-    """
-    Calls HF Inference chat completion.
-    - Keeps your structure (InferenceClient)
-    - Adds retry with smaller max_tokens
-    - Falls back to SAFE_FALLBACK_MODEL if the chosen model fails with BadRequest/timeout
-    """
     def _call(mdl: str, mx: int) -> str:
         client = InferenceClient(model=mdl, token=HF_TOKEN)
         resp = client.chat_completion(
@@ -465,17 +468,25 @@ def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, tempe
         content = getattr(msg, "content", None) or msg["content"]
         return (content or "").strip()
 
+    # Attempt 1
     try:
         return _call(model, max_new_tokens)
-    except (BadRequestError, InferenceTimeoutError, requests.RequestException):
-        # retry with smaller output
+    except Exception as e:
+        # Retry on timeouts/request errors with smaller output
+        is_timeout_like = ((HFTimeout is not None and isinstance(e, HFTimeout)) or
+                           isinstance(e, (RequestException, HTTPError)))
+        if is_timeout_like:
+            try:
+                return _call(model, max(max_new_tokens // 2, 128))
+            except Exception:
+                pass
+        # Fallback model as last resort
         try:
-            return _call(model, max(max_new_tokens // 2, 128))
-        except Exception:
-            # fallback to a safe public model
             if model != SAFE_FALLBACK_MODEL:
                 return _call(SAFE_FALLBACK_MODEL, max(max_new_tokens // 2, 128))
-            raise
+        except Exception:
+            pass
+        raise
 
 # =========================
 # Enhanced Controller System
@@ -525,7 +536,7 @@ class EvidenceStore:
         self.rag_chunks: List[Dict[str,Any]] = []
         self.seen_urls = set()
         self.seen_hashes = set()
-        self.tool_history: List[Dict[str, Any]] = []  # Track what was tried
+        self.tool_history: List[Dict[str, Any]] = []
 
     def add_tool_call(self, tool: str, inp: Any, result: Dict[str, Any], added: int):
         self.tool_history.append({
@@ -856,7 +867,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
     return final_answer, steps
 
 # =========================
-# Sidebar Configuration (unchanged)
+# Sidebar Configuration (unchanged UI)
 # =========================
 with st.sidebar:
     st.header("⚙️ Configuration")

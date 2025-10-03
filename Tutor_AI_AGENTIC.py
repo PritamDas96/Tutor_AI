@@ -1,5 +1,6 @@
+# app.py
 # GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith
-# (Hardened, LC DuckDuckGo search, no hardcoding, health-check logs silenced)
+# (Hardened: deterministic URL picking from search hits, auto-follow read_url, fixed reflection interval)
 
 import os, io, re, json, hashlib, requests, time, logging
 from typing import List, Dict, Any, Tuple, Optional
@@ -9,7 +10,7 @@ os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 # Optional: reduce misc telemetry
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 
-# Silence Tornado access logs (hides GET /script-health-check spam)
+# Silence Tornado access logs (hides GET /script-health-check console spam)
 for _name in ("tornado.access", "tornado.application", "tornado.general"):
     logging.getLogger(_name).setLevel(logging.ERROR)
 
@@ -21,14 +22,14 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient
 from requests.exceptions import HTTPError, RequestException
 try:
-    from huggingface_hub import InferenceTimeoutError as HFTimeout  # optional if available
+    from huggingface_hub import InferenceTimeoutError as HFTimeout  # optional on newer hub
 except Exception:
     HFTimeout = None
 
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace
 
-# LangChain DuckDuckGo (free) for web search
+# Free web search via LangChain DuckDuckGo
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
 # =========================
@@ -63,7 +64,7 @@ HF_MODELS = [
     "google/gemma-2-9b-it",
     "Qwen/Qwen2.5-7B-Instruct",
 ]
-SAFE_FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"  # used only if the chosen model errors repeatedly
+SAFE_FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"  # used only if chosen model errors repeatedly
 
 SCENARIOS: Dict[str, Dict[str, str]] = {
     "Gen-AI Fundamentals": {
@@ -256,7 +257,7 @@ def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
 
     def _once(q: str) -> List[Dict[str, str]]:
         items = wrapper.results(q, max_results=max_results) or []
-        out = []
+        out: List[Dict[str, str]] = []
         for r in items:
             title = (r.get("title") or "").strip()
             url = (r.get("link") or "").strip()
@@ -339,7 +340,8 @@ def tool_web_search(inp: Any) -> Dict[str, Any]:
             "error": f"No web results found for: {query}",
             "suggestion": "Try broader keywords or use rag_retrieve for conceptual topics"
         }
-    return {"results": res, "summary": f"Found {len(res)} web results for '{query}'"}
+    # Important: summary uses the actual query
+    return {"results": res, "summary": f"Found {len(res)} web results for '{(query or '').strip()}'"}
 
 def tool_read_url(inp: Any) -> Dict[str, Any]:
     if isinstance(inp, dict):
@@ -356,31 +358,38 @@ def tool_read_url(inp: Any) -> Dict[str, Any]:
     url = str(url).strip('"').strip("'")
     if not url.startswith("http"):
         return {"error": "Invalid URL format (must start with http:// or https://)"}
-    try:
-        r = requests.get(url, headers={"User-Agent":"TutorAI/2.0 (+https://example.com)"}, timeout=25)
-        r.raise_for_status()
-        ctype = (r.headers.get("Content-Type","")).lower()
-        if "pdf" in ctype or url.lower().endswith(".pdf"):
-            text = _clean_pdf(r.content)
+
+    headers = {"User-Agent":"TutorAI/2.0 (+https://example.com) Mozilla/5.0"}
+    for attempt in (1, 2):  # one retry
+        try:
+            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
+            r.raise_for_status()
+            ctype = (r.headers.get("Content-Type","")).lower()
+            if "pdf" in ctype or url.lower().endswith(".pdf"):
+                text = _clean_pdf(r.content)
+                if not text or len(text) < 50:
+                    return {"error": f"PDF text extraction was empty for {url}",
+                            "suggestion": "This PDF may be scanned or blocked. Try an HTML version or another source."}
+            else:
+                text = _clean_html(r.content)
             if not text or len(text) < 50:
-                return {"error": f"PDF text extraction was empty for {url}",
-                        "suggestion": "This PDF may be scanned or blocked. Try an HTML version or another source."}
-        else:
-            text = _clean_html(r.content)
-        if not text or len(text) < 50:
-            return {"error": f"No meaningful content extracted from {url}"}
-        text_trimmed = text[:max_chars]
-        return {
-            "title": url.split("/")[-1][:100],
-            "url": url,
-            "text": text_trimmed,
-            "char_count": len(text_trimmed),
-            "summary": f"Extracted {len(text_trimmed)} chars from {url}"
-        }
-    except requests.RequestException as e:
-        return {"error": f"Failed to fetch {url}: {str(e)[:100]}"}
-    except Exception as e:
-        return {"error": f"Failed to process {url}: {str(e)[:100]}"}
+                return {"error": f"No meaningful content extracted from {url}"}
+            text_trimmed = text[:max_chars]
+            return {
+                "title": url.split("/")[-1][:100],
+                "url": url,
+                "text": text_trimmed,
+                "char_count": len(text_trimmed),
+                "summary": f"Extracted {len(text_trimmed)} chars from {url}"
+            }
+        except requests.RequestException as e:
+            if attempt == 2:
+                return {"error": f"Failed to fetch {url}: {str(e)[:120]}"}
+            time.sleep(0.8)
+        except Exception as e:
+            if attempt == 2:
+                return {"error": f"Failed to process {url}: {str(e)[:120]}"}
+            time.sleep(0.8)
 
 def tool_rag_retrieve(inp: Any) -> Dict[str, Any]:
     try:
@@ -515,7 +524,7 @@ CRITICAL RULES:
 - Use web_search for recent events, pricing, product features
 - After web_search, consider read_url on top 1-2 URLs for depth
 - Include "thought" every 2-3 steps to reflect on progress
-- Stop when you have enough evidence OR all useful strategies exhausted
+- Stop when you have enough evidence OR all strategies exhausted
 - Never call the same tool with the same query twice
 - Return ONLY valid JSON, no markdown, no explanation outside JSON
 
@@ -527,7 +536,7 @@ No thoughts or stops before the first tool call.
 """
 
 # =========================
-# Evidence Store with Quality Tracking
+# Evidence Store + URL picking helper
 # =========================
 class EvidenceStore:
     def __init__(self):
@@ -626,6 +635,17 @@ class EvidenceStore:
             text = text[:max_chars] + "\n[Evidence truncated due to length]"
         return text, citations
 
+def pick_top_urls_from_hits(hits: List[Dict[str, str]], n: int = 2) -> List[str]:
+    """Deterministic selection from actual search hits (prevents fabricated URLs)."""
+    urls: List[str] = []
+    for h in hits:
+        u = (h.get("url") or "").strip()
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+        if len(urls) >= n:
+            break
+    return urls
+
 # =========================
 # Sliding Context Window
 # =========================
@@ -658,14 +678,14 @@ class SlidingContext:
         return msgs
 
 # =========================
-# Robust Agent with Smart Tool Selection (structure preserved)
+# Robust Agent with Smart Tool Selection (reflection interval fixed to 3)
 # =========================
 def run_agent(
     user_input: str,
     model_id: str,
     scenario_sys: str,
     max_steps: int = 10,
-    reflection_interval: int = 3
+    reflection_interval: int = 3  # fixed; UI no longer changes this
 ) -> Tuple[str, List[Dict[str, Any]]]:
     steps = []
     ev = EvidenceStore()
@@ -784,11 +804,33 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                 no_evidence_count += 1
             else:
                 if tool == "web_search" and "results" in result:
+                    # Add search hits
                     added = ev.add_search(result["results"])
                     quality_note = result.get("summary", f"Added {added} web results")
+
+                    # NEW: deterministically auto-follow top 1–2 URLs from actual hits (prevents fabricated URLs)
+                    top_urls = pick_top_urls_from_hits(result["results"], n=2)
+                    # Let planner see the URLs list (nudges it to reuse these)
+                    preview = "\n".join(f"- {h['title'][:80]} :: {h['url']}" for h in result["results"][:5])
+                    ctx.add_interaction('{"tool":"web_search","input":{}}', f"Top search URLs:\n{preview}")
+
+                    for u in top_urls:
+                        try:
+                            with trace("tool:read_url(auto_follow)", run_type="tool", inputs={"input": {"url": u, "max_chars": 8000}}) as tspan2:
+                                r2 = TOOLS["read_url"]({"url": u, "max_chars": 8000})
+                                tspan2.outputs = {"result": r2}
+                            if "error" in r2:
+                                steps.append({"role":"tool","tool":"read_url","content":_summarize_text(f"Auto-follow failed: {r2['error']}",900),"added":0,"step":step})
+                            else:
+                                added_page = ev.add_page(r2)
+                                steps.append({"role":"tool","tool":"read_url","content":_summarize_text(r2.get("summary","Fetched page"),900),"added":added_page,"step":step})
+                        except Exception as e:
+                            steps.append({"role":"tool","tool":"read_url","content":f"Auto-follow exception: {str(e)[:120]}", "added":0, "step":step})
+
                 elif tool == "read_url" and "text" in result:
                     added = ev.add_page(result)
                     quality_note = result.get("summary", f"Added {added} page")
+
                 elif tool == "rag_retrieve" and "results" in result:
                     added = ev.add_rag(result["results"])
                     avg_score = result.get("avg_score", 0.0)
@@ -800,8 +842,9 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                         quality_note += "\n✓ MEDIUM quality - acceptable for answering."
                     elif 0 < avg_score < 0.3:
                         quality_note += "\n⚠️ LOW quality - try web_search for better results."
+
                 obs = quality_note if quality_note else json.dumps(result, ensure_ascii=False)[:800]
-                if added == 0:
+                if added == 0 and tool != "web_search":  # web_search adds snippets; pages added separately
                     no_evidence_count += 1
                 else:
                     no_evidence_count = 0
@@ -819,7 +862,6 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
 
     # Final synthesis
     context_text, cites = ev.context_pack(max_chars=18000)
-    total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
 
     if not context_text or len(context_text) < 100:
         final_answer = (
@@ -867,7 +909,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
     return final_answer, steps
 
 # =========================
-# Sidebar Configuration (unchanged UI)
+# Sidebar Configuration (reflection interval removed from UI)
 # =========================
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -878,7 +920,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🤖 Agent Settings")
     max_steps = st.slider("Max planning steps", 3, 15, 10, help="Maximum tool calls before forcing stop")
-    reflection_interval = st.slider("Reflection interval", 2, 5, 3, help="Planner reflects every N steps")
 
     st.markdown("---")
     st.subheader("📚 RAG Corpus")
@@ -900,7 +941,7 @@ with st.sidebar:
     st.caption(f"**Scenario:** {scenario_name}")
 
 # =========================
-# Main Chat Interface (unchanged)
+# Main Chat Interface
 # =========================
 st.markdown("---")
 st.subheader("💬 Intelligent Tutor Chat")
@@ -948,7 +989,7 @@ if user_query:
                             model_id=model_id,
                             scenario_sys=SCENARIOS[scenario_name]["system"],
                             max_steps=max_steps,
-                            reflection_interval=reflection_interval
+                            reflection_interval=3  # fixed here too
                         )
             except Exception as e:
                 answer = f"⚠️ **Agent Error**\n\nThe agentic system encountered an error: {str(e)}\n\nPlease try rephrasing your question."
@@ -987,7 +1028,7 @@ if user_query:
     st.session_state.messages.append({"role": "assistant", "content": answer})
 
 # =========================
-# Information Panel (unchanged)
+# Information Panel
 # =========================
 st.markdown("---")
 col1, col2 = st.columns(2)
@@ -1007,7 +1048,7 @@ with col2:
     """)
 
 # =========================
-# Example Questions (unchanged)
+# Example Questions
 # =========================
 st.markdown("---")
 st.subheader("💡 Try These Questions")
@@ -1029,7 +1070,7 @@ with example_cols[2]:
         st.rerun()
 
 # =========================
-# Footer (unchanged)
+# Footer
 # =========================
 st.markdown("---")
 st.caption("⚠️ **Educational Use Only** • Verify critical information • Follow your organization's AI policies")

@@ -1,21 +1,12 @@
-# LangGraph Agent • HF + LangSmith • Streamlit
-# - No system prompt shown in UI (constant below)
-# - File watcher disabled to avoid inotify errors
-# - Uses langchain_huggingface.ChatHuggingFace with HuggingFaceEndpoint (no deprecation)
-# - Web search via LangChain DuckDuckGo tool, plus read_url & rewrite_query tools
-
+# Robust LangGraph Agent • HF + LangSmith • Streamlit (422-safe, no watcher)
 import os
-os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")  # disable file watcher early
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")  # avoid inotify
 
-import re
-import json
-import time
-import requests
-from typing import Any, Dict, List
+import re, json, time, requests
+from typing import Any, Dict, List, Tuple
 
 import streamlit as st
 st.set_page_config(page_title="LangGraph Agent (HF + LangSmith)", layout="wide")
-# double safety in case the env var is ignored in some hosts:
 try:
     st.set_option("server.fileWatcherType", "none")
 except Exception:
@@ -29,8 +20,8 @@ from langchain.tools import Tool
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langgraph.prebuilt import create_react_agent
 
-# HF chat wrapper (correct, non-deprecated)
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+# Correct, non-deprecated HF chat wrapper
+from langchain_huggingface import ChatHuggingFace
 
 # ------------------------------
 # Secrets & Environment
@@ -55,13 +46,12 @@ if LS_KEY:
 SYSTEM_PROMPT = (
     "You are a precise, practical, and safe AI tutor. "
     "Use tools when needed. Prefer web_search for time-sensitive facts. "
-    "If search returns nothing, rewrite the query, then try again. "
-    "Avoid repeating the exact same failing query."
+    "Rewrite queries when search fails and avoid repeating the same failing query."
 )
 
-# -----------------------------------
-# Utilities: clean & fetch HTML
-# -----------------------------------
+# ------------------------------
+# Helpers: clean & fetch HTML
+# ------------------------------
 def clean_html(html: bytes) -> str:
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -89,9 +79,9 @@ def http_read(url: str, timeout: int = 20) -> Dict[str, Any]:
     except requests.RequestException as e:
         return {"error": f"Fetch failed: {e}"}
 
-# -----------------------------------
-# Query Rewrite
-# -----------------------------------
+# ------------------------------
+# Query rewrite
+# ------------------------------
 def rewrite_query(q: str) -> str:
     q0 = q.strip()
     q1 = re.sub(r"\bopen\s*ai\b", "openai", q0, flags=re.I)
@@ -101,9 +91,9 @@ def rewrite_query(q: str) -> str:
     q1 = re.sub(r"\s{2,}", " ", q1).strip()
     return q1 or q0
 
-# -----------------------------------
+# ------------------------------
 # Tools
-# -----------------------------------
+# ------------------------------
 def make_web_search_tool(k: int = 8) -> Tool:
     def _search(q: str) -> str:
         st.session_state.setdefault("_seen_queries", set())
@@ -166,36 +156,78 @@ def make_rewrite_tool() -> Tool:
         func=_rewrite,
     )
 
-# -----------------------------------
-# Build Agent (LangGraph ReAct)
-# -----------------------------------
-def build_agent(model_id: str) -> Any:
-    # Correct non-deprecated chat wrapper:
-    endpoint = HuggingFaceEndpoint(
-        repo_id=model_id,
-        task="text-generation",
-        temperature=0.2,
-        max_new_tokens=512,
-    )
-    llm = ChatHuggingFace(llm=endpoint)
+# ------------------------------
+# Hugging Face chat model (422-safe)
+# ------------------------------
+SAFE_PRIMARY_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+SAFE_FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
 
-    tools = [
-        make_rewrite_tool(),
-        make_web_search_tool(k=8),
-        make_read_url_tool(),
-    ]
+def make_llm(model_id: str, max_new_tokens: int = 512):
+    """
+    Use the supported, non-deprecated constructor and pass only params
+    accepted by HF Inference API for text-generation. Avoid odd kwargs.
+    """
+    model_kwargs = {
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "do_sample": True,
+        "max_new_tokens": max_new_tokens,
+        "return_full_text": False,  # helps some backends
+    }
+    # ChatHuggingFace.from_model_id will configure the endpoint for text-generation
+    return ChatHuggingFace.from_model_id(
+        model_id=model_id,
+        task="text-generation",
+        model_kwargs=model_kwargs,
+    )
+
+def build_agent(model_id: str):
+    # Construct LLM with safe params; if it raises 4xx later, we catch & fallback in run_agent.
+    llm = make_llm(model_id=model_id, max_new_tokens=512)
+    tools = [make_rewrite_tool(), make_web_search_tool(k=8), make_read_url_tool()]
     agent = create_react_agent(llm, tools)
     return agent
 
-def run_agent(user_query: str, model_id: str) -> Dict[str, Any]:
-    agent = build_agent(model_id=model_id)
+def _invoke_agent(agent, user_query: str) -> Dict[str, Any]:
     state = {
         "messages": [
             SystemMessage(SYSTEM_PROMPT),
             HumanMessage(user_query),
         ]
     }
-    final_state = agent.invoke(state)
+    return agent.invoke(state)
+
+def run_agent(user_query: str, model_id: str) -> Dict[str, Any]:
+    """
+    Robust invoke with:
+    - retry once with smaller max_new_tokens (handles context/size issues)
+    - fallback to a second model on 4xx/422/BadRequest style errors
+    """
+    try:
+        agent = build_agent(model_id=model_id)
+        final_state = _invoke_agent(agent, user_query)
+    except Exception as e1:
+        # Try smaller output first (common fix for 422 on some models)
+        try:
+            llm_small = make_llm(model_id=model_id, max_new_tokens=256)
+            agent_small = create_react_agent(llm_small, [make_rewrite_tool(), make_web_search_tool(8), make_read_url_tool()])
+            final_state = _invoke_agent(agent_small, user_query)
+        except Exception as e2:
+            # Fall back to a second (friendly) model
+            try:
+                llm_fb = make_llm(model_id=SAFE_FALLBACK_MODEL, max_new_tokens=512)
+                agent_fb = create_react_agent(llm_fb, [make_rewrite_tool(), make_web_search_tool(8), make_read_url_tool()])
+                final_state = _invoke_agent(agent_fb, user_query)
+                st.warning(f"Primary model failed ({type(e1).__name__}). Switched to fallback: {SAFE_FALLBACK_MODEL}")
+            except Exception as e3:
+                # Last resort: small output on fallback
+                llm_fb_small = make_llm(model_id=SAFE_FALLBACK_MODEL, max_new_tokens=256)
+                agent_fb_small = create_react_agent(llm_fb_small, [make_rewrite_tool(), make_web_search_tool(8), make_read_url_tool()])
+                final_state = _invoke_agent(agent_fb_small, user_query)
+                st.warning(f"Primary model failed ({type(e1).__name__}); fallback large failed ({type(e2).__name__}). "
+                           f"Using fallback small: {SAFE_FALLBACK_MODEL}")
+
+    # Extract final assistant message
     msgs: List = final_state["messages"]
     answer = ""
     for m in reversed(msgs):
@@ -205,14 +237,14 @@ def run_agent(user_query: str, model_id: str) -> Dict[str, Any]:
     return {"answer": answer, "raw": final_state}
 
 # ------------------------------
-# Sidebar (no system prompt)
+# Sidebar (no system prompt here)
 # ------------------------------
 st.sidebar.header("⚙️ Settings")
 model_id = st.sidebar.selectbox(
     "Hugging Face Model",
     [
-        "meta-llama/Meta-Llama-3-8B-Instruct",
-        "mistralai/Mistral-7B-Instruct-v0.2",
+        SAFE_PRIMARY_MODEL,
+        SAFE_FALLBACK_MODEL,
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "google/gemma-2-9b-it",
         "Qwen/Qwen2.5-7B-Instruct",
@@ -269,4 +301,4 @@ if user_query:
     st.session_state.chat.append({"role": "assistant", "content": out["answer"]})
 
 st.markdown("---")
-st.caption("Tools: rewrite_query → web_search → read_url. No system prompt shown in UI. File watcher disabled to avoid inotify errors.")
+st.caption("Tools: rewrite_query → web_search → read_url. System prompt is hidden. File watcher disabled to avoid inotify errors.")

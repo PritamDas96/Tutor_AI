@@ -1,4 +1,12 @@
+# LangGraph Agent • HF + LangSmith • Streamlit
+# - No system prompt shown in UI (constant below)
+# - File watcher disabled to avoid inotify errors
+# - Uses langchain_huggingface.ChatHuggingFace with HuggingFaceEndpoint (no deprecation)
+# - Web search via LangChain DuckDuckGo tool, plus read_url & rewrite_query tools
+
 import os
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")  # disable file watcher early
+
 import re
 import json
 import time
@@ -6,21 +14,27 @@ import requests
 from typing import Any, Dict, List
 
 import streamlit as st
+st.set_page_config(page_title="LangGraph Agent (HF + LangSmith)", layout="wide")
+# double safety in case the env var is ignored in some hosts:
+try:
+    st.set_option("server.fileWatcherType", "none")
+except Exception:
+    pass
+
 from bs4 import BeautifulSoup
 
-# ---- LangChain / LangGraph / Tools ----
+# LangChain / LangGraph
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.tools import Tool
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
-from langchain_community.chat_models.huggingface import ChatHuggingFace
 from langgraph.prebuilt import create_react_agent
 
-# ------------------------------
-# Streamlit Page + Secrets
-# ------------------------------
-st.set_page_config(page_title="LangGraph Agent (HF + LangSmith)", layout="wide")
-st.markdown("<h1>🔎 LangGraph Agent • Web Search via LangChain Tools</h1>", unsafe_allow_html=True)
+# HF chat wrapper (correct, non-deprecated)
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
+# ------------------------------
+# Secrets & Environment
+# ------------------------------
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 LS_KEY   = st.secrets.get("LANGSMITH_API_KEY") or os.environ.get("LANGSMITH_API_KEY", "")
 LS_PROJ  = st.secrets.get("LANGSMITH_PROJECT") or os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-Agentic")
@@ -29,15 +43,24 @@ if not HF_TOKEN:
     st.error("Missing HF_TOKEN in Streamlit Secrets or env.")
     st.stop()
 
-# Set env for HF + LangSmith tracing
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
 if LS_KEY:
     os.environ["LANGSMITH_API_KEY"] = LS_KEY
     os.environ.setdefault("LANGSMITH_TRACING", "true")
     os.environ.setdefault("LANGSMITH_PROJECT", LS_PROJ)
 
+# ------------------------------
+# System Prompt (not in UI)
+# ------------------------------
+SYSTEM_PROMPT = (
+    "You are a precise, practical, and safe AI tutor. "
+    "Use tools when needed. Prefer web_search for time-sensitive facts. "
+    "If search returns nothing, rewrite the query, then try again. "
+    "Avoid repeating the exact same failing query."
+)
+
 # -----------------------------------
-# Robust Utilities (read_url cleaner)
+# Utilities: clean & fetch HTML
 # -----------------------------------
 def clean_html(html: bytes) -> str:
     try:
@@ -66,84 +89,64 @@ def http_read(url: str, timeout: int = 20) -> Dict[str, Any]:
     except requests.RequestException as e:
         return {"error": f"Fetch failed: {e}"}
 
-# ----------------------------------------------------
-# Query Rewrite Tool (normalization + de-noising)
-# ----------------------------------------------------
+# -----------------------------------
+# Query Rewrite
+# -----------------------------------
 def rewrite_query(q: str) -> str:
     q0 = q.strip()
-    # normalize brand/model tokens
     q1 = re.sub(r"\bopen\s*ai\b", "openai", q0, flags=re.I)
     q1 = re.sub(r"\bgpt\s*[- ]?\s*5\b", "gpt-5", q1, flags=re.I)
     q1 = re.sub(r"\bgpt\s*[- ]?\s*4\.?o?\b", "gpt-4o", q1, flags=re.I)
-
-    # remove noise words once
     q1 = re.sub(r"\b(latest|new|pricing model|official)\b", "", q1, flags=re.I)
-    # collapse multiple spaces
     q1 = re.sub(r"\s{2,}", " ", q1).strip()
     return q1 or q0
 
-# ----------------------------------------------------
-# Web Search Tool (DuckDuckGo via LangChain wrapper)
-# - single-use instance per call
-# - retry/backoff once
-# - dedupe repeated queries
-# ----------------------------------------------------
+# -----------------------------------
+# Tools
+# -----------------------------------
 def make_web_search_tool(k: int = 8) -> Tool:
     def _search(q: str) -> str:
-        # de-dupe guard across the session
         st.session_state.setdefault("_seen_queries", set())
         if q in st.session_state["_seen_queries"]:
-            # auto rewrite once if repeated
             q2 = rewrite_query(q)
             if q2 != q:
                 q = q2
             else:
-                # add a lightweight broadening: drop years/noisy tokens
                 q = re.sub(r"\b(202[0-9])\b", "", q).strip()
         st.session_state["_seen_queries"].add(q)
 
         def _do(kwords: str) -> List[Dict[str, str]]:
             ddg = DuckDuckGoSearchAPIWrapper(region="us-en", time="y", max_results=k)
             rs = ddg.results(kwords, max_results=k)
-            cleaned = []
+            out = []
             for r in rs:
-                cleaned.append({
+                out.append({
                     "title": (r.get("title") or "")[:140],
                     "link": r.get("link") or "",
                     "snippet": (r.get("snippet") or "")[:300]
                 })
-            return cleaned
+            return out
 
         try:
             results = _do(q)
-        except Exception as e:
-            # retry once after a short sleep (rate limit / transient)
+        except Exception:
             time.sleep(1.0)
             results = _do(q)
 
-        # If nothing, try broadened query once
         if not results and len(q.split()) >= 3:
             q_simple = re.sub(r"\b(202[0-9]|latest|pricing model)\b", "", q, flags=re.I)
             q_simple = " ".join(w for w in q_simple.split() if len(w) > 2).strip()
             if q_simple and q_simple.lower() != q.lower():
                 results = _do(q_simple)
 
-        # return a compact JSON-ish string to save tokens
         return json.dumps(results[:k], ensure_ascii=False)
 
     return Tool(
         name="web_search",
-        description=(
-            "Search the public web (DuckDuckGo). "
-            "Use for up-to-date info: prices, docs, news, product features. "
-            "Input a concise query."
-        ),
+        description="Search the public web (DuckDuckGo). Use for prices, docs, news. Input a concise query.",
         func=_search,
     )
 
-# ----------------------------------------------------
-# Read URL Tool
-# ----------------------------------------------------
 def make_read_url_tool() -> Tool:
     def _read(url: str) -> str:
         out = http_read(url)
@@ -154,31 +157,28 @@ def make_read_url_tool() -> Tool:
         func=_read,
     )
 
-# ----------------------------------------------------
-# Query Rewrite Tool (explicit)
-# ----------------------------------------------------
 def make_rewrite_tool() -> Tool:
     def _rewrite(q: str) -> str:
         return rewrite_query(q)
     return Tool(
         name="rewrite_query",
-        description=(
-            "Normalize and simplify a search query. "
-            "Use this before web_search if the query looks noisy or brand/model names are misspelled."
-        ),
+        description="Normalize/simplify a search query (fix brand/model names, remove noise).",
         func=_rewrite,
     )
 
-# ----------------------------------------------------
-# Build LangGraph Agent (ReAct)
-# ----------------------------------------------------
+# -----------------------------------
+# Build Agent (LangGraph ReAct)
+# -----------------------------------
 def build_agent(model_id: str) -> Any:
-    # Hugging Face chat model via LangChain
-    llm = ChatHuggingFace(
+    # Correct non-deprecated chat wrapper:
+    endpoint = HuggingFaceEndpoint(
         repo_id=model_id,
+        task="text-generation",
         temperature=0.2,
         max_new_tokens=512,
     )
+    llm = ChatHuggingFace(llm=endpoint)
+
     tools = [
         make_rewrite_tool(),
         make_web_search_tool(k=8),
@@ -187,31 +187,25 @@ def build_agent(model_id: str) -> Any:
     agent = create_react_agent(llm, tools)
     return agent
 
-# ----------------------------------------------------
-# Invoke Agent
-# ----------------------------------------------------
-def run_agent(user_query: str, model_id: str, system_prompt: str) -> Dict[str, Any]:
+def run_agent(user_query: str, model_id: str) -> Dict[str, Any]:
     agent = build_agent(model_id=model_id)
     state = {
         "messages": [
-            SystemMessage(system_prompt),
+            SystemMessage(SYSTEM_PROMPT),
             HumanMessage(user_query),
         ]
     }
     final_state = agent.invoke(state)
-
-    # Extract last AI message
     msgs: List = final_state["messages"]
     answer = ""
     for m in reversed(msgs):
         if isinstance(m, AIMessage):
             answer = m.content
             break
-
     return {"answer": answer, "raw": final_state}
 
 # ------------------------------
-# Sidebar Controls
+# Sidebar (no system prompt)
 # ------------------------------
 st.sidebar.header("⚙️ Settings")
 model_id = st.sidebar.selectbox(
@@ -225,13 +219,8 @@ model_id = st.sidebar.selectbox(
     ],
     index=0
 )
-system_prompt = st.sidebar.text_area(
-    "System Prompt",
-    value="You are a precise, practical, and safe AI tutor. Decide when to invoke tools. Prefer web_search for time-sensitive facts.",
-    height=120
-)
+st.sidebar.caption("LangSmith tracing is enabled if you set LANGSMITH_API_KEY.")
 
-st.sidebar.caption("LangSmith tracing uses your LANGSMITH_API_KEY if provided.")
 st.sidebar.markdown("---")
 st.sidebar.subheader("Search Health")
 if st.sidebar.button("Run health check"):
@@ -252,7 +241,7 @@ if st.sidebar.button("Run health check"):
 # ------------------------------
 # Chat UI
 # ------------------------------
-st.markdown("---")
+st.markdown("<hr>", unsafe_allow_html=True)
 st.subheader("💬 Chat")
 
 if "chat" not in st.session_state:
@@ -272,17 +261,12 @@ if user_query:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking with LangGraph agent…"):
-            out = run_agent(
-                user_query=user_query,
-                model_id=model_id,
-                system_prompt=system_prompt
-            )
+            out = run_agent(user_query=user_query, model_id=model_id)
             st.markdown(out["answer"])
-            # Debug / Trace panel (raw agent state)
             with st.expander("🔍 Agent Trace (raw LangGraph state)", expanded=False):
                 st.json(out["raw"], expanded=False)
 
     st.session_state.chat.append({"role": "assistant", "content": out["answer"]})
 
 st.markdown("---")
-st.caption("Tip: If a query looks too specific, the agent may call `rewrite_query` before `web_search` and then `read_url`.")
+st.caption("Tools: rewrite_query → web_search → read_url. No system prompt shown in UI. File watcher disabled to avoid inotify errors.")

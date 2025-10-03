@@ -1,7 +1,7 @@
 # app.py
-# GenAI-Tutor — Agentic (Custom JSON Controller) + RAG + Tools + LangSmith (HF-only)
+# GenAI-Tutor — Agentic (JSON Controller + Router) + RAG + Tools + LangSmith (HF-only)
 
-import os, io, json, re, hashlib, requests, time
+import os, io, json, re, hashlib, requests
 from typing import List, Dict, Any, Tuple
 
 import numpy as np
@@ -20,7 +20,7 @@ from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 # Streamlit & Secrets
 # =========================
 st.set_page_config(page_title="GenAI-Tutor (Agentic + RAG)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Agentic + RAG (HF-only, JSON controller)</h1>", unsafe_allow_html=True)
+st.markdown("<h1>🎓 GenAI-Tutor — Agentic + RAG (HF-only, JSON controller + router)</h1>", unsafe_allow_html=True)
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -185,13 +185,17 @@ try:
 except Exception:
     pass
 
+def ensure_rag_ready():
+    if _global_rag["index"] is None or _global_rag["side"] is None:
+        idx, side = build_rag_index(DOC_LINKS)
+        _global_rag["index"], _global_rag["side"] = idx, side
+
 # =========================
 # Tool helpers & tools
 # =========================
 def _extract_json_block(text: str) -> Dict[str, Any]:
     # Return the first {...} JSON object in text, if any
     try:
-        # fallback-safe: unbalanced but practical
         m = re.search(r"\{.*\}", text, flags=re.S)
     except re.error:
         m = None
@@ -201,7 +205,6 @@ def _extract_json_block(text: str) -> Dict[str, Any]:
     try:
         return json.loads(s)
     except Exception:
-        # try removing trailing commas
         s2 = re.sub(r",\s*([}\]])", r"\1", s)
         try:
             return json.loads(s2)
@@ -252,11 +255,6 @@ def tool_read_url(inp: str) -> Dict[str, Any]:
     except Exception as e:
         return {"title": url, "url": url, "text": f"[Error: {e}]"}
 
-def ensure_rag_ready():
-    if _global_rag["index"] is None or _global_rag["side"] is None:
-        idx, side = build_rag_index(DOC_LINKS)
-        _global_rag["index"], _global_rag["side"] = idx, side
-
 def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
     """Retrieve from curated Gen-AI corpus. Input: natural text or JSON {query,top_k}. Output: {'results': [...]} or {'note': ...}"""
     try:
@@ -270,6 +268,8 @@ def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
     except:
         k = TOP_K
     results = retrieve(q, _global_rag["index"], _global_rag["side"])[:k]
+    if not results and k < 7:  # adaptive depth
+        results = retrieve(q, _global_rag["index"], _global_rag["side"])[:7]
     if not results:
         return {"note":"No evidence retrieved from corpus for this query."}
     out = [{"title":c["title"], "url":c["url"], "chunk":c["text"][:900], "score":float(c.get("score_rerank",0.0))} for c in results]
@@ -293,7 +293,43 @@ def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, tempe
     return (content or "").strip()
 
 # =========================
-# JSON Controller System Prompt (FIXED)
+# Router + Answerability
+# =========================
+def classify_route(user_input: str, model_id: str, prefer_web: bool = False) -> str:
+    """Return 'rag' | 'web' | 'direct'."""
+    sys = (
+        "Classify the best route to answer.\n"
+        "Return ONLY one token: rag | web | direct.\n"
+        "- rag: conceptual/how-to/education/pedagogy/policy about Gen-AI\n"
+        "- web: current events or outside curated corpus\n"
+        "- direct: short general explanation without tools\n"
+        f"{'If ambiguous, prefer web.' if prefer_web else ''}"
+    )
+    out = hf_chat(model_id, [
+        {"role":"system","content": sys},
+        {"role":"user","content": f"User: {user_input}\nRoute:"}
+    ], max_new_tokens=4, temperature=0.0)
+    out = out.strip().lower()
+    if "web" in out: return "web"
+    if "rag" in out: return "rag"
+    if "direct" in out: return "direct"
+    return "rag"
+
+def can_answer_direct(user_input: str, model_id: str) -> bool:
+    """Yes/No if the model can answer confidently without tools."""
+    sys = (
+        "Answer with YES or NO only.\n"
+        "YES if you can confidently answer the question without external tools.\n"
+        "NO if you need retrieval or web to be accurate."
+    )
+    out = hf_chat(model_id, [
+        {"role":"system","content": sys},
+        {"role":"user","content": f"Question: {user_input}\nAnswer:"}
+    ], max_new_tokens=2, temperature=0.0)
+    return out.strip().lower().startswith("y")
+
+# =========================
+# JSON Controller System Prompt
 # =========================
 CONTROLLER_SYSTEM = (
     "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
@@ -305,12 +341,16 @@ CONTROLLER_SYSTEM = (
     "2) To finalize:\n"
     '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."} ] }\n\n'
     "Notes:\n"
+    "- Use the provided Route hint: if route=rag, call rag_retrieve first; if route=web, call web_search then read_url; if direct, finalize without tools.\n"
     "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
     "- Prefer rag_retrieve for Gen-AI learning topics; then at most one web_search.\n"
     "- Cite sources you relied on. Keep answers concise and factual.\n"
 )
 
-def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, List[Dict[str, Any]]]:
+# =========================
+# Agent Controller
+# =========================
+def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Returns (final_answer, trace_steps)
     trace_steps: list of {role, content} and tool observations for debug panel.
@@ -319,11 +359,28 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
     citations_pool: List[Dict[str,str]] = []
     empty_hits = 0
 
+    # 0) Try direct answer quickly
+    try:
+        if can_answer_direct(user_input, model_id):
+            direct = hf_chat(model_id, [
+                {"role":"system","content":"Answer clearly and concisely. Cite reliable sources if you know them."},
+                {"role":"user","content": user_input}
+            ], max_new_tokens=512, temperature=0.3)
+            return direct, steps
+    except Exception:
+        pass
+
+    # 1) Decide route once per turn
+    try:
+        route = classify_route(user_input, model_id, prefer_web=prefer_web)
+    except Exception:
+        route = "rag"
+
     controller_msgs = [{"role":"system","content": CONTROLLER_SYSTEM}]
-    controller_msgs.append({"role":"user","content": f"User question: {user_input}"})
+    controller_msgs.append({"role":"user","content": f"Route: {route}\nUser question: {user_input}"})
 
     for step in range(1, max_steps+1):
-        with trace("controller_step", run_type="chain", inputs={"step": step}):
+        with trace("controller_step", run_type="chain", inputs={"step": step, "route": route}):
             raw = hf_chat(model_id, controller_msgs, max_new_tokens=256, temperature=0.2, top_p=0.9)
             steps.append({"role":"assistant", "content": raw})
             parsed = _extract_json_block(raw)
@@ -393,6 +450,11 @@ def run_agent(user_input: str, model_id: str, max_steps: int = 6) -> Tuple[str, 
             controller_msgs.append({"role":"assistant","content": raw})
             controller_msgs.append({"role":"user","content": f"Observation:\n{_summarize_text_for_obs(obs_str)}\n\nReturn the next JSON. If sufficient, finalize."})
 
+            # Early stop: enough sources gathered
+            if len({c.get('url') for c in citations_pool if c.get('url')}) >= 2:
+                # Encourage finalize
+                controller_msgs.append({"role":"user","content":"You have enough evidence (2+ sources). Finalize now."})
+
             if empty_hits >= 2:
                 break
 
@@ -418,6 +480,7 @@ with st.sidebar:
     scenario_name = st.selectbox("Learning Scenario", SCENARIOS.keys(), index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
     max_steps = st.slider("Max tool calls per turn", 1, 10, 6)
+    prefer_web = st.checkbox("Prefer Web for ambiguous queries", value=False)
     st.markdown("---")
     st.subheader("📚 RAG Corpus")
     c1, c2 = st.columns(2)
@@ -453,21 +516,21 @@ if st.session_state.scenario_prev != scenario_name:
     _seed_chat(); st.session_state.scenario_prev = scenario_name
 
 st.markdown("---")
-st.subheader("💬 Tutor Chat (Agentic JSON)")
+st.subheader("💬 Tutor Chat (Agentic JSON + Router)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
         st.markdown(m["content"])
 
-user_q = st.chat_input("Ask a question. The agent may use RAG, WebSearch, ReadURL…")
+user_q = st.chat_input("Ask a question. The agent may use RAG, WebSearch, or ReadURL…")
 if user_q:
     st.session_state.messages.append({"role":"user","content":user_q})
     with tracing_context(project_name=LS_PROJECT, metadata={"type":"agent_turn","scenario":scenario_name,"model":model_id}):
-        with trace("agent_turn", run_type="chain", inputs={"question": user_q}):
+        with trace("agent_turn", run_type="chain", inputs={"question": user_q, "prefer_web": prefer_web}):
             with st.chat_message("assistant"):
                 with st.spinner("Thinking with tools…"):
                     try:
-                        answer, step_trace = run_agent(user_q, model_id, max_steps=max_steps)
+                        answer, step_trace = run_agent(user_q, model_id, max_steps=max_steps, prefer_web=prefer_web)
                     except Exception as e:
                         answer, step_trace = f"⚠️ Agent failed: {e}", []
 

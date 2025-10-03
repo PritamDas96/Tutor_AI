@@ -6,7 +6,7 @@ faiss-cpu>=1.7.4
 pypdf>=4.2.0
 beautifulsoup4>=4.12.2
 requests>=2.31.0
-
+ddgs
 # --- observability + eval ---
 langsmith
 ragas>=0.3.5

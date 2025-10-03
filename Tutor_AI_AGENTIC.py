@@ -218,7 +218,26 @@ def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
             if title and url:
                 results.append({"title": title, "url": url, "snippet": snippet})
     except Exception:
-        return []
+        pass
+    
+    # If no results, try alternative formulations
+    if not results and len(query.split()) > 2:
+        try:
+            # Try removing qualifiers like "in gen ai", "2024", etc.
+            simple_query = query.replace(" in gen ai", "").replace(" in genai", "")
+            simple_query = simple_query.replace(" 2024", "").replace(" 2025", "")
+            simple_query = " ".join([w for w in simple_query.split() if len(w) > 3])
+            
+            if simple_query and simple_query != query:
+                for r in ddg.text(keywords=simple_query, max_results=max_results, region="wt-wt", safesearch="moderate"):
+                    title = r.get("title") or ""
+                    url = r.get("href") or r.get("url") or ""
+                    snippet = r.get("body") or ""
+                    if title and url:
+                        results.append({"title": title, "url": url, "snippet": snippet})
+        except Exception:
+            pass
+    
     return results
 
 # =========================
@@ -268,19 +287,35 @@ def _summarize_text(s: str, limit: int = 800) -> str:
 def tool_web_search(inp: str) -> Dict[str, Any]:
     """
     Search the web for current information.
-    Input: {"query": "search terms", "max_results": 8}
+    Input: {"query": "search terms", "max_results": 8} OR plain text query
     Output: {"results": [...], "summary": "X results found"} or {"error": "..."}
     """
-    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
-    query = data.get("query") or inp.strip()
+    # Handle both dict and string inputs
+    if isinstance(inp, dict):
+        data = inp
+    elif isinstance(inp, str):
+        if inp.strip().startswith("{"):
+            data = _extract_json_block(inp)
+        else:
+            data = {}
+    else:
+        data = {}
+    
+    query = data.get("query") or (inp if isinstance(inp, str) else "").strip()
     max_results = int(data.get("max_results", 8)) if str(data.get("max_results","")).isdigit() else 8
     
-    if not query:
-        return {"error": "Empty search query"}
+    if not query or len(query) < 3:
+        return {"error": "Empty or too short search query"}
+    
+    # Clean query from JSON artifacts
+    query = str(query).strip('"').strip("'")
     
     res = web_search(query, max_results=max_results)
     if not res:
-        return {"error": f"No web results found for: {query}", "suggestion": "Try different keywords or use rag_retrieve for conceptual topics"}
+        return {
+            "error": f"No web results found for: {query}",
+            "suggestion": "Try broader keywords, remove year/date constraints, or use rag_retrieve for conceptual topics"
+        }
     
     return {
         "results": res,
@@ -290,15 +325,28 @@ def tool_web_search(inp: str) -> Dict[str, Any]:
 def tool_read_url(inp: str) -> Dict[str, Any]:
     """
     Fetch and extract text from a URL.
-    Input: {"url": "https://...", "max_chars": 8000}
+    Input: {"url": "https://...", "max_chars": 8000} OR plain URL string
     Output: {"title": "...", "url": "...", "text": "...", "char_count": N} or {"error": "..."}
     """
-    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
-    url = data.get("url") or inp.strip()
+    # Handle both dict and string inputs
+    if isinstance(inp, dict):
+        data = inp
+    elif isinstance(inp, str):
+        if inp.strip().startswith("{"):
+            data = _extract_json_block(inp)
+        else:
+            data = {}
+    else:
+        data = {}
+    
+    url = data.get("url") or (inp if isinstance(inp, str) else "").strip()
     max_chars = int(data.get("max_chars", 8000)) if str(data.get("max_chars","")).isdigit() else 8000
     
+    # Clean URL from JSON artifacts
+    url = str(url).strip('"').strip("'")
+    
     if not url.startswith("http"):
-        return {"error": "Invalid URL format"}
+        return {"error": "Invalid URL format (must start with http:// or https://)"}
     
     try:
         r = requests.get(url, headers={"User-Agent":"TutorAI/2.0"}, timeout=25)
@@ -329,7 +377,7 @@ def tool_read_url(inp: str) -> Dict[str, Any]:
 def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
     """
     Retrieve from curated Gen-AI education corpus.
-    Input: {"query": "...", "top_k": 7}
+    Input: {"query": "...", "top_k": 7} OR plain text query
     Output: {"results": [...], "avg_score": 0.X, "summary": "..."} or {"error": "..."}
     """
     try:
@@ -337,11 +385,24 @@ def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"RAG index unavailable: {e}", "suggestion": "Use web_search instead"}
     
-    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
-    q = data.get("query") or inp.strip()
+    # Handle both dict and string inputs
+    if isinstance(inp, dict):
+        data = inp
+    elif isinstance(inp, str):
+        if inp.strip().startswith("{"):
+            data = _extract_json_block(inp)
+        else:
+            data = {}
+    else:
+        data = {}
     
-    if not q:
-        return {"error": "Empty RAG query"}
+    q = data.get("query") or (inp if isinstance(inp, str) else "").strip()
+    
+    # Clean query from JSON artifacts
+    q = str(q).strip('"').strip("'")
+    
+    if not q or len(q) < 3:
+        return {"error": "Empty or too short RAG query"}
     
     try:
         k = int(data.get("top_k", TOP_K))
@@ -354,7 +415,7 @@ def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
     if not results:
         return {
             "error": f"No relevant content in RAG corpus for: {q}",
-            "suggestion": "Try web_search for this topic",
+            "suggestion": "Topic may be outside corpus scope. Try web_search for broader coverage.",
             "avg_score": 0.0
         }
     
@@ -365,10 +426,19 @@ def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
         "score": round(c.get("score_rerank", 0.0), 3)
     } for c in results]
     
+    # Provide guidance based on quality
+    quality_note = ""
+    if avg_score >= 0.5:
+        quality_note = " (HIGH quality - good match)"
+    elif avg_score >= 0.3:
+        quality_note = " (MEDIUM quality - acceptable)"
+    else:
+        quality_note = " (LOW quality - consider web_search)"
+    
     return {
         "results": out,
         "avg_score": round(avg_score, 3),
-        "summary": f"Retrieved {len(out)} chunks (avg score: {avg_score:.2f})"
+        "summary": f"Retrieved {len(out)} chunks (avg score: {avg_score:.2f}){quality_note}"
     }
 
 TOOLS = {
@@ -384,11 +454,14 @@ Available tools:
 3. read_url: Fetch and read content from a specific URL (use after web_search to get full article content)
 
 Tool selection strategy:
-- START with rag_retrieve for conceptual/educational questions
-- If RAG returns low quality (avg_score < 0.3) or error, switch to web_search
-- Use web_search for time-sensitive or product-specific queries
-- Use read_url to fetch full content from promising web_search results
-- Avoid redundant calls: don't search the same query twice
+- START with rag_retrieve for conceptual/educational questions about Gen-AI fundamentals
+- If RAG returns HIGH quality (avg_score >= 0.5), you have good evidence - consider stopping
+- If RAG returns MEDIUM quality (0.3-0.5), you have acceptable evidence - may add web_search for supplemental info
+- If RAG returns LOW quality (< 0.3) or error, immediately switch to web_search
+- Use web_search for time-sensitive queries (news, pricing, recent features)
+- After web_search, use read_url on the most promising 1-2 URLs for depth
+- Avoid redundant calls: don't search the same query twice with different phrasing
+- STOP when you have 5+ high-quality pieces of evidence OR all strategies exhausted
 """
 
 # =========================
@@ -609,15 +682,22 @@ def run_agent(
         # Periodic reflection
         reflection = None
         if step > 1 and step % reflection_interval == 0:
+            total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
+            recent_tools = [h["tool"] for h in ev.tool_history[-3:]]
             reflection = f"""
-REFLECTION CHECKPOINT:
-{ev.get_summary()}
-Tools tried: {len(ev.tool_history)}
+🔍 REFLECTION CHECKPOINT (Step {step}):
+Evidence gathered: {ev.get_summary()}
+Recent tools used: {', '.join(recent_tools)}
 
-Assess: Do you have sufficient evidence to answer the question? 
-If not, what specific information is still missing?
-If RAG had low quality, have you tried web_search?
-Return your assessment as {{"thought": "..."}} followed by next action or stop.
+Critical questions:
+1. Do you have sufficient HIGH-QUALITY evidence to answer the user's question?
+2. If RAG returned good results (score >= 0.5), why are you still searching?
+3. If web_search keeps failing, have you tried simpler/broader keywords?
+4. Are you repeating the same unsuccessful strategy?
+
+Decision: Return {{"thought": "..."}} with your assessment, then either:
+- {{"stop": true, "reason": "sufficient evidence"}} if you can answer well
+- {{"tool": "...", "input": {{...}}}} with a NEW strategy if gaps remain
 """
         
         msgs = ctx.build_messages(reflection)
@@ -649,11 +729,8 @@ Return your assessment as {{"thought": "..."}} followed by next action or stop.
             tool = parsed.get("tool")
             tool_inp_raw = parsed.get("input", "")
             
-            # Convert input to string if it's a dict
-            if isinstance(tool_inp_raw, dict):
-                tool_inp = json.dumps(tool_inp_raw)
-            else:
-                tool_inp = str(tool_inp_raw)
+            # Keep input as-is (tools will handle dict or string)
+            tool_inp = tool_inp_raw
             
             if not tool or tool not in TOOLS:
                 invalid_call_count += 1
@@ -677,12 +754,13 @@ Return your assessment as {{"thought": "..."}} followed by next action or stop.
             # Aggregate evidence and track quality
             added = 0
             quality_note = ""
+            should_consider_stopping = False
             
             if "error" in result:
                 # Tool failed - provide guidance
                 error_msg = result["error"]
                 suggestion = result.get("suggestion", "")
-                obs = f"Tool {tool} failed: {error_msg}\n{suggestion}"
+                obs = f"❌ {tool} failed: {error_msg}\n💡 {suggestion}" if suggestion else f"❌ {tool} failed: {error_msg}"
                 no_evidence_count += 1
             else:
                 # Tool succeeded
@@ -695,11 +773,16 @@ Return your assessment as {{"thought": "..."}} followed by next action or stop.
                 elif tool == "rag_retrieve" and "results" in result:
                     added = ev.add_rag(result["results"])
                     avg_score = result.get("avg_score", 0.0)
-                    quality_note = f"Added {added} RAG chunks (avg quality: {avg_score:.2f})"
+                    quality_note = result.get("summary", f"Added {added} RAG chunks (avg quality: {avg_score:.2f})")
                     
-                    # Smart fallback: if RAG quality is low, suggest web search
-                    if avg_score < 0.3 and added > 0:
-                        quality_note += "\nNOTE: Low RAG relevance. Consider web_search for this topic."
+                    # Smart guidance based on RAG quality
+                    if avg_score >= 0.5 and added >= 5:
+                        quality_note += "\n✅ HIGH quality results! This is strong evidence. Consider if you need more sources or can stop."
+                        should_consider_stopping = True
+                    elif avg_score >= 0.3:
+                        quality_note += "\n✓ MEDIUM quality - acceptable for answering."
+                    elif avg_score > 0 and avg_score < 0.3:
+                        quality_note += "\n⚠️ LOW quality - try web_search for better results."
                 
                 obs = quality_note if quality_note else json.dumps(result, ensure_ascii=False)[:800]
                 
@@ -723,28 +806,35 @@ Return your assessment as {{"thought": "..."}} followed by next action or stop.
             
             # Check stopping conditions
             if no_evidence_count >= max_no_evidence:
-                steps.append({"role": "stop", "content": "No new evidence from recent attempts, stopping", "step": step})
+                steps.append({"role": "stop", "content": "Multiple tools returned no evidence. Stopping to synthesize what we have.", "step": step})
                 break
             
-            # Auto-suggest stop if we have good evidence
+            # Suggest stop if we have strong evidence
             total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
-            if total_evidence >= 8 and step >= 4:
-                suggestion = f"\nYou have {total_evidence} pieces of evidence. Consider if this is sufficient to answer the question."
-                ctx.add_interaction("", suggestion)
+            if should_consider_stopping or (total_evidence >= 7 and step >= 3):
+                suggestion = f"\n💡 You now have {total_evidence} pieces of evidence. If this covers the question well, consider stopping."
+                obs += suggestion
     
     # Final synthesis with complete evidence
     context_text, cites = ev.context_pack(max_chars=18000)
+    
+    # Calculate evidence quality
+    total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
+    high_quality_rag = sum(1 for c in ev.rag_chunks if c.get("score", 0) >= 0.5)
     
     if not context_text or len(context_text) < 100:
         # No evidence gathered
         final_answer = (
             "I apologize, but I was unable to gather sufficient evidence to answer your question. "
             "The available sources did not contain relevant information. "
-            "This could mean:\n"
-            "- The topic is outside the scope of my curated corpus\n"
+            "\n\n**Possible reasons:**\n"
+            "- The topic may be outside the scope of my curated corpus\n"
             "- Web search did not return authoritative results\n"
             "- The question may need to be rephrased for better results\n\n"
-            "Please try rephrasing your question or ask about a related topic."
+            "**Suggestions:**\n"
+            "- Try rephrasing with different keywords\n"
+            "- Ask about related but broader topics\n"
+            "- Break down complex questions into simpler parts"
         )
     else:
         # Build citation reference

@@ -1,25 +1,25 @@
 # app.py
-# GenAI-Tutor — Robust Agentic System (Planner-only tools → Final Synthesis) + RAG + Web + LangSmith (HF-only)
+# GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith
 
 import os, io, re, json, hashlib, requests
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import streamlit as st
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from ddgs import DDGS  # web search
+from ddgs import DDGS
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient
 
 from langsmith import Client
-from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
+from langsmith.run_helpers import tracing_context, trace
 
 # =========================
 # Streamlit & Secrets
 # =========================
-st.set_page_config(page_title="GenAI-Tutor (Agentic, Robust)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Robust Agentic Tutor (HF-only)</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor (Robust Agentic)", layout="wide")
+st.markdown("<h1>🎓 GenAI-Tutor — Robust Agentic System</h1>", unsafe_allow_html=True)
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -82,6 +82,7 @@ TOP_K = 7
 K_CANDIDATES = 30
 WORDS_PER_CHUNK = 450
 OVERLAP_WORDS = 80
+MIN_RERANK_SCORE = 0.15  # Quality threshold
 
 @st.cache_data(show_spinner=False)
 def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
@@ -160,7 +161,10 @@ def build_rag_index(doc_links: List[Dict[str, Any]]):
     side = {"chunks": all_chunks, "vectors_shape": vectors.shape}
     return index, side
 
-def retrieve(query: str, index, side: Dict[str, Any]) -> List[Dict[str, Any]]:
+def retrieve(query: str, index, side: Dict[str, Any], top_k: int = TOP_K) -> Tuple[List[Dict[str, Any]], float]:
+    """
+    Returns (results, avg_score). avg_score helps planner assess quality.
+    """
     import faiss
     embedder, reranker = load_embedder(), load_reranker()
     qv = embed_texts([query], embedder)
@@ -170,13 +174,21 @@ def retrieve(query: str, index, side: Dict[str, Any]) -> List[Dict[str, Any]]:
         if ci < 0: continue
         c = side["chunks"][ci]
         candidates.append({"rank_ann":rank,"score_ann":float(s),**c})
-    if not candidates: return []
+    if not candidates: return [], 0.0
     pairs = [(query, c["text"]) for c in candidates]
     rers = reranker.predict(pairs, batch_size=64).tolist()
     for c, rs in zip(candidates, rers): c["score_rerank"] = float(rs)
-    return sorted(candidates, key=lambda x: x["score_rerank"], reverse=True)[:TOP_K]
+    
+    # Filter by quality threshold
+    quality_results = [c for c in candidates if c["score_rerank"] >= MIN_RERANK_SCORE]
+    if not quality_results:
+        return [], 0.0
+    
+    sorted_results = sorted(quality_results, key=lambda x: x["score_rerank"], reverse=True)[:top_k]
+    avg_score = sum(c["score_rerank"] for c in sorted_results) / len(sorted_results)
+    return sorted_results, avg_score
 
-# Build global RAG on import (fails silently)
+# Build global RAG on import
 _global_rag = {"index": None, "side": None}
 try:
     idx0, side0 = build_rag_index(DOC_LINKS)
@@ -195,11 +207,11 @@ def ensure_rag_ready():
 @st.cache_resource(show_spinner=False)
 def get_ddg(): return DDGS()
 
-def web_search(query: str, max_results: int = 8, region: str = "wt-wt", lang: str = "en") -> List[Dict[str, str]]:
+def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
     results = []
     try:
         ddg = get_ddg()
-        for r in ddg.text(keywords=query, max_results=max_results, region=region, safesearch="moderate"):
+        for r in ddg.text(keywords=query, max_results=max_results, region="wt-wt", safesearch="moderate"):
             title = r.get("title") or ""
             url = r.get("href") or r.get("url") or ""
             snippet = r.get("body") or ""
@@ -210,79 +222,174 @@ def web_search(query: str, max_results: int = 8, region: str = "wt-wt", lang: st
     return results
 
 # =========================
-# Tools (callable by planner)
+# Improved JSON Parsing
 # =========================
 def _extract_json_block(text: str) -> Dict[str, Any]:
+    """
+    Robust JSON extraction: finds the last complete JSON object in text.
+    Handles LLM responses with explanatory text before/after JSON.
+    """
+    # Try to find all complete JSON objects
     try:
-        m = re.search(r"\{.*\}", text, flags=re.S)
+        matches = list(re.finditer(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', text, re.DOTALL))
     except re.error:
-        m = None
-    if not m:
+        matches = []
+    
+    if not matches:
         return {}
-    s = m.group(0)
-    try:
-        return json.loads(s)
-    except Exception:
-        # attempt trailing comma cleanup
-        s2 = re.sub(r",\s*([}\]])", r"\1", s)
+    
+    # Try parsing from last match backwards (most likely to be the actual tool call)
+    for match in reversed(matches):
+        s = match.group(0)
         try:
-            return json.loads(s2)
-        except Exception:
-            return {}
+            obj = json.loads(s)
+            # Validate it has expected structure
+            if isinstance(obj, dict) and (obj.get("tool") or obj.get("stop") or obj.get("thought")):
+                return obj
+        except json.JSONDecodeError:
+            # Try fixing trailing commas
+            s_fixed = re.sub(r',\s*([}\]])', r'\1', s)
+            try:
+                obj = json.loads(s_fixed)
+                if isinstance(obj, dict) and (obj.get("tool") or obj.get("stop") or obj.get("thought")):
+                    return obj
+            except:
+                continue
+    
+    return {}
 
-def _summarize_text_for_obs(s: str, limit: int = 1000) -> str:
+def _summarize_text(s: str, limit: int = 800) -> str:
+    """Truncate text for observations."""
     return s[:limit] + ("…" if len(s) > limit else "")
 
+# =========================
+# Tools with Quality Checks
+# =========================
 def tool_web_search(inp: str) -> Dict[str, Any]:
-    """Search the web. Input: natural text or JSON {query,max_results}. Output: {'results': [...]} or {'note': ...}"""
-    data = _extract_json_block(inp) or {}
+    """
+    Search the web for current information.
+    Input: {"query": "search terms", "max_results": 8}
+    Output: {"results": [...], "summary": "X results found"} or {"error": "..."}
+    """
+    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     query = data.get("query") or inp.strip()
     max_results = int(data.get("max_results", 8)) if str(data.get("max_results","")).isdigit() else 8
-
+    
+    if not query:
+        return {"error": "Empty search query"}
+    
     res = web_search(query, max_results=max_results)
     if not res:
-        res = web_search(query + " site:openai.com OR site:nature.com OR site:aclanthology.org OR site:research.google", max_results=max_results)
-    return {"results": res} if res else {"note": "No results found."}
+        return {"error": f"No web results found for: {query}", "suggestion": "Try different keywords or use rag_retrieve for conceptual topics"}
+    
+    return {
+        "results": res,
+        "summary": f"Found {len(res)} web results for '{query}'"
+    }
 
 def tool_read_url(inp: str) -> Dict[str, Any]:
-    """Read a URL (HTML or PDF). Input: URL or JSON {url,max_chars}. Output: {'title','url','text'}"""
-    data = _extract_json_block(inp) or {}
+    """
+    Fetch and extract text from a URL.
+    Input: {"url": "https://...", "max_chars": 8000}
+    Output: {"title": "...", "url": "...", "text": "...", "char_count": N} or {"error": "..."}
+    """
+    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     url = data.get("url") or inp.strip()
-    max_chars = int(data.get("max_chars", 9000)) if str(data.get("max_chars","")).isdigit() else 9000
+    max_chars = int(data.get("max_chars", 8000)) if str(data.get("max_chars","")).isdigit() else 8000
+    
+    if not url.startswith("http"):
+        return {"error": "Invalid URL format"}
+    
     try:
-        r = requests.get(url, headers={"User-Agent":"TutorAI/1.0"}, timeout=25)
+        r = requests.get(url, headers={"User-Agent":"TutorAI/2.0"}, timeout=25)
         r.raise_for_status()
         ctype = (r.headers.get("Content-Type","")).lower()
-        text = _clean_pdf(r.content) if ("pdf" in ctype or url.lower().endswith(".pdf")) else _clean_html(r.content)
-        return {"title": url, "url": url, "text": text[:max_chars]}
+        
+        if "pdf" in ctype or url.lower().endswith(".pdf"):
+            text = _clean_pdf(r.content)
+        else:
+            text = _clean_html(r.content)
+        
+        if not text or len(text) < 50:
+            return {"error": f"No meaningful content extracted from {url}"}
+        
+        text_trimmed = text[:max_chars]
+        return {
+            "title": url.split("/")[-1][:100],
+            "url": url,
+            "text": text_trimmed,
+            "char_count": len(text_trimmed),
+            "summary": f"Extracted {len(text_trimmed)} chars from {url}"
+        }
+    except requests.RequestException as e:
+        return {"error": f"Failed to fetch {url}: {str(e)[:100]}"}
     except Exception as e:
-        return {"title": url, "url": url, "text": f"[Error: {e}]"}
+        return {"error": f"Failed to process {url}: {str(e)[:100]}"}
 
 def tool_rag_retrieve(inp: str) -> Dict[str, Any]:
-    """Retrieve from curated Gen-AI corpus. Input: natural text or JSON {query,top_k}. Output: {'results': [...]} or {'note': ...}"""
+    """
+    Retrieve from curated Gen-AI education corpus.
+    Input: {"query": "...", "top_k": 7}
+    Output: {"results": [...], "avg_score": 0.X, "summary": "..."} or {"error": "..."}
+    """
     try:
         ensure_rag_ready()
     except Exception as e:
-        return {"note": f"RAG index unavailable: {e}"}
-    data = _extract_json_block(inp) or {}
+        return {"error": f"RAG index unavailable: {e}", "suggestion": "Use web_search instead"}
+    
+    data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     q = data.get("query") or inp.strip()
+    
+    if not q:
+        return {"error": "Empty RAG query"}
+    
     try:
-        k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
+        k = int(data.get("top_k", TOP_K))
+        k = max(1, min(10, k))
     except:
         k = TOP_K
-    results = retrieve(q, _global_rag["index"], _global_rag["side"])[:k]
-    if not results and k < 9:  # adaptive depth
-        results = retrieve(q, _global_rag["index"], _global_rag["side"])[:9]
+    
+    results, avg_score = retrieve(q, _global_rag["index"], _global_rag["side"], top_k=k)
+    
     if not results:
-        return {"note":"No evidence retrieved from corpus."}
-    out = [{"title":c["title"], "url":c["url"], "chunk":c["text"][:900], "score":float(c.get("score_rerank",0.0))} for c in results]
-    return {"results": out}
+        return {
+            "error": f"No relevant content in RAG corpus for: {q}",
+            "suggestion": "Try web_search for this topic",
+            "avg_score": 0.0
+        }
+    
+    out = [{
+        "title": c["title"],
+        "url": c["url"],
+        "chunk": c["text"][:900],
+        "score": round(c.get("score_rerank", 0.0), 3)
+    } for c in results]
+    
+    return {
+        "results": out,
+        "avg_score": round(avg_score, 3),
+        "summary": f"Retrieved {len(out)} chunks (avg score: {avg_score:.2f})"
+    }
 
 TOOLS = {
     "rag_retrieve": tool_rag_retrieve,
     "web_search": tool_web_search,
     "read_url": tool_read_url,
 }
+
+TOOL_DESCRIPTIONS = """
+Available tools:
+1. rag_retrieve: Search curated Gen-AI education corpus (best for: fundamental concepts, pedagogical approaches, ethical considerations, established best practices)
+2. web_search: Search the internet (best for: recent news, current pricing, product updates, latest research, real-time information)
+3. read_url: Fetch and read content from a specific URL (use after web_search to get full article content)
+
+Tool selection strategy:
+- START with rag_retrieve for conceptual/educational questions
+- If RAG returns low quality (avg_score < 0.3) or error, switch to web_search
+- Use web_search for time-sensitive or product-specific queries
+- Use read_url to fetch full content from promising web_search results
+- Avoid redundant calls: don't search the same query twice
+"""
 
 # =========================
 # HF chat wrapper
@@ -296,61 +403,85 @@ def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, tempe
     return (content or "").strip()
 
 # =========================
-# Planner-only Controller (NO final during planning)
+# Enhanced Controller System
 # =========================
 def controller_system_text(scenario_sys: str) -> str:
-    return (
-        "You are the Planner for GenAI-Tutor. Your job is to decide which tools to call to gather evidence. "
-        "Do NOT produce the final answer. Keep planning until you have enough evidence (or no useful tools remain), "
-        "then return a stop signal.\n\n"
-        "Available tools (call names exactly): rag_retrieve, web_search, read_url.\n"
-        "RETURN FORMAT (MUST be a single JSON object, no extra text):\n"
-        '1) To call a tool: { "tool": "rag_retrieve" | "web_search" | "read_url", "input": "<single string or JSON string>" }\n'
-        '2) To stop planning: { "stop": true, "note": "<why you stopped>" }\n\n'
-        "Guidelines:\n"
-        "- Prefer rag_retrieve for conceptual/how-to/pedagogy/policy questions within the curated corpus.\n"
-        "- Use web_search for recent news, pricing, product changes, or topics likely outside the corpus.\n"
-        "- After a web_search, consider read_url on the most authoritative link(s).\n"
-        "- Avoid duplicate work; request only new, relevant evidence. Do not finalize here."
-    )
+    return f"""{scenario_sys}
+
+You are the Planner for GenAI-Tutor. Your job is to intelligently select tools to gather evidence, then signal when ready.
+
+{TOOL_DESCRIPTIONS}
+
+RESPONSE FORMAT (must be valid JSON only, no extra text):
+
+1. To think/reflect:
+{{"thought": "brief reasoning about what to do next"}}
+
+2. To call a tool:
+{{"tool": "rag_retrieve|web_search|read_url", "input": {{"query": "...", ...}}}}
+
+3. To stop planning:
+{{"stop": true, "reason": "sufficient evidence gathered | no more useful tools"}}
+
+CRITICAL RULES:
+- ALWAYS start with rag_retrieve for educational/conceptual questions
+- If rag_retrieve returns error or avg_score < 0.3, immediately try web_search
+- Use web_search for recent events, pricing, product features
+- After web_search, consider read_url on top 1-2 URLs for depth
+- Include "thought" every 2-3 steps to reflect on progress
+- Stop when you have enough evidence OR all useful strategies exhausted
+- Never call the same tool with the same query twice
+- Return ONLY valid JSON, no markdown, no explanation outside JSON
+"""
 
 # =========================
-# Evidence Aggregator
+# Evidence Store with Quality Tracking
 # =========================
 class EvidenceStore:
     def __init__(self):
         self.search_hits: List[Dict[str,str]] = []
-        self.pages: Dict[str, Dict[str,str]] = {}  # url -> {title,url,text}
+        self.pages: Dict[str, Dict[str,str]] = {}
         self.rag_chunks: List[Dict[str,Any]] = []
         self.seen_urls = set()
         self.seen_hashes = set()
+        self.tool_history: List[Dict[str, Any]] = []  # Track what was tried
 
-    def add_search(self, items: List[Dict[str,str]]):
+    def add_tool_call(self, tool: str, inp: str, result: Dict[str, Any], added: int):
+        """Track tool usage for reflection."""
+        self.tool_history.append({
+            "tool": tool,
+            "input": inp[:100],
+            "success": "error" not in result,
+            "added": added,
+            "quality": result.get("avg_score", 0.0) if tool == "rag_retrieve" else None
+        })
+
+    def add_search(self, items: List[Dict[str,str]]) -> int:
         added = 0
         for it in items:
             u = it.get("url","")
-            if not u: continue
-            if u not in self.seen_urls:
-                self.seen_urls.add(u)
-                self.search_hits.append(it)
-                added += 1
+            if not u or u in self.seen_urls: continue
+            self.seen_urls.add(u)
+            self.search_hits.append(it)
+            added += 1
         return added
 
-    def add_page(self, page: Dict[str,str]):
+    def add_page(self, page: Dict[str,str]) -> int:
         u = page.get("url","")
         txt = page.get("text","")
-        if not u: return 0
+        if not u or not txt or len(txt) < 50: return 0
         h = hashlib.sha1((u + txt[:1000]).encode()).hexdigest()
         if h in self.seen_hashes: return 0
         self.seen_hashes.add(h)
         self.pages[u] = {"title": page.get("title",u), "url": u, "text": txt}
         return 1
 
-    def add_rag(self, items: List[Dict[str,Any]]):
+    def add_rag(self, items: List[Dict[str,Any]]) -> int:
         added = 0
         for it in items:
-            u = it.get("url","")
             chunk = it.get("chunk","")
+            if not chunk or len(chunk) < 30: continue
+            u = it.get("url","")
             h = hashlib.sha1((u + chunk[:400]).encode()).hexdigest()
             if h in self.seen_hashes: continue
             self.seen_hashes.add(h)
@@ -358,249 +489,500 @@ class EvidenceStore:
             added += 1
         return added
 
-    def context_pack(self, max_chars: int = 16000) -> Tuple[str, List[Dict[str,str]]]:
-        """
-        Build a compact context string with numbered citations.
-        Returns (context_text, citations_list)
-        """
+    def get_summary(self) -> str:
+        """Summary for planner reflection."""
+        return f"Evidence: {len(self.rag_chunks)} RAG chunks, {len(self.pages)} full pages, {len(self.search_hits)} web snippets"
+
+    def context_pack(self, max_chars: int = 18000) -> Tuple[str, List[Dict[str,str]]]:
+        """Build context with numbered citations."""
         citations: List[Dict[str,str]] = []
         lines = []
-
-        # RAG chunks
         url_to_num = {}
+        
         def cite_for(url, title):
             if url not in url_to_num:
                 url_to_num[url] = len(url_to_num) + 1
                 citations.append({"title": title or "source", "url": url})
             return url_to_num[url]
 
+        # RAG chunks (prioritize high scores)
         if self.rag_chunks:
-            lines.append("### RAG Evidence")
-            for it in self.rag_chunks[:10]:
+            lines.append("### RAG Evidence (Curated Corpus)")
+            sorted_chunks = sorted(self.rag_chunks, key=lambda x: x.get("score", 0), reverse=True)
+            for it in sorted_chunks[:8]:
                 r = cite_for(it.get("url",""), it.get("title","source"))
-                snippet = it.get("chunk","")
-                snippet = snippet[:700] + ("…" if len(snippet) > 700 else "")
-                lines.append(f"[{r}] {it.get('title','source')}\n{snippet}\n")
+                snippet = it.get("chunk","")[:750]
+                score = it.get("score", 0)
+                lines.append(f"[{r}] {it.get('title','source')} (relevance: {score:.2f})\n{snippet}\n")
 
-        # Web pages
+        # Full pages
         if self.pages:
-            lines.append("### Web Pages")
-            # keep up to 6 pages
-            for u, p in list(self.pages.items())[:6]:
+            lines.append("### Web Pages (Full Content)")
+            for u, p in list(self.pages.items())[:5]:
                 r = cite_for(u, p.get("title",u))
-                snippet = (p.get("text","") or "")[:900]
-                snippet = snippet + ("…" if len(p.get("text","")) > 900 else "")
+                snippet = (p.get("text",""))[:1200]
                 lines.append(f"[{r}] {p.get('title',u)}\n{snippet}\n")
 
-        # Web search (snippets) if page not fetched
+        # Web snippets (only if page not fetched)
         if self.search_hits:
             lines.append("### Web Search Snippets")
             kept = 0
             for hit in self.search_hits:
-                if kept >= 6: break
-                u = hit.get("url",""); t = hit.get("title","source")
+                if kept >= 5: break
+                u = hit.get("url","")
                 if u in self.pages: continue
-                r = cite_for(u, t)
-                snippet = (hit.get("snippet","") or "")[:400]
-                lines.append(f"[{r}] {t}\n{snippet}\n")
+                r = cite_for(u, hit.get("title",""))
+                snippet = hit.get("snippet","")[:400]
+                lines.append(f"[{r}] {hit.get('title','')}\n{snippet}\n")
                 kept += 1
 
         text = "\n".join(lines)
         if len(text) > max_chars:
-            text = text[:max_chars] + "\n…"
+            text = text[:max_chars] + "\n[Evidence truncated due to length]"
+        
         return text, citations
 
 # =========================
-# Run Planner Loop → Gather Evidence → Final Synthesis
+# Sliding Context Window
 # =========================
-def run_agent(user_input: str, model_id: str, scenario_sys: str, max_steps: int = 8, stagnation_patience: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
+class SlidingContext:
+    """Maintains last N tool interactions to prevent context overflow."""
+    def __init__(self, max_interactions: int = 5):
+        self.system_msg = None
+        self.user_query = None
+        self.interactions: List[Tuple[str, str]] = []  # (planner_response, observation)
+        self.max_interactions = max_interactions
+
+    def set_initial(self, system: str, user_query: str):
+        self.system_msg = system
+        self.user_query = user_query
+
+    def add_interaction(self, planner_resp: str, observation: str):
+        self.interactions.append((planner_resp, observation))
+        if len(self.interactions) > self.max_interactions:
+            self.interactions.pop(0)
+
+    def build_messages(self, reflection: Optional[str] = None) -> List[Dict[str, str]]:
+        msgs = [
+            {"role": "system", "content": self.system_msg},
+            {"role": "user", "content": f"User question: {self.user_query}"}
+        ]
+        
+        for planner_resp, obs in self.interactions:
+            msgs.append({"role": "assistant", "content": planner_resp})
+            msgs.append({"role": "user", "content": f"Observation: {obs}"})
+        
+        if reflection:
+            msgs.append({"role": "user", "content": reflection})
+        
+        return msgs
+
+# =========================
+# Robust Agent with Smart Tool Selection
+# =========================
+def run_agent(
+    user_input: str,
+    model_id: str,
+    scenario_sys: str,
+    max_steps: int = 10,
+    reflection_interval: int = 3
+) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Planning loop where LLM ONLY calls tools or stops; never finalizes here.
-    After loop, we compile all evidence and run a final synthesis LLM call with full context.
-    Returns (final_answer, step_trace).
+    Enhanced agentic loop with:
+    - Smart tool selection based on query type and previous results
+    - Quality-based fallback (RAG → Web)
+    - Reflection every N steps
+    - Sliding context window
+    - Separate counters for different failure modes
     """
     steps = []
     ev = EvidenceStore()
-    msgs = [
-        {"role":"system","content": controller_system_text(scenario_sys)},
-        {"role":"user","content": f"User question: {user_input}"}
-    ]
+    ctx = SlidingContext(max_interactions=5)
+    ctx.set_initial(controller_system_text(scenario_sys), user_input)
+    
+    invalid_call_count = 0
+    no_evidence_count = 0
+    max_invalid = 2
+    max_no_evidence = 4
+    
+    for step in range(1, max_steps + 1):
+        # Periodic reflection
+        reflection = None
+        if step > 1 and step % reflection_interval == 0:
+            reflection = f"""
+REFLECTION CHECKPOINT:
+{ev.get_summary()}
+Tools tried: {len(ev.tool_history)}
 
-    no_new_ctr = 0
-    total_added = 0
-
-    for step in range(1, max_steps+1):
-        with trace("planner_step", run_type="chain", inputs={"step": step}):
-            planner_out = hf_chat(model_id, msgs, max_new_tokens=256, temperature=0.2)
-            steps.append({"role":"assistant","content": planner_out})
-            parsed = _extract_json_block(planner_out)
-
-            if parsed.get("stop") is True:
-                steps.append({"role":"tool","tool":"_STOP","content": parsed.get("note","planner stop")})
+Assess: Do you have sufficient evidence to answer the question? 
+If not, what specific information is still missing?
+If RAG had low quality, have you tried web_search?
+Return your assessment as {{"thought": "..."}} followed by next action or stop.
+"""
+        
+        msgs = ctx.build_messages(reflection)
+        
+        with trace("planner_step", run_type="chain", inputs={"step": step, "evidence_count": len(ev.rag_chunks) + len(ev.pages)}):
+            try:
+                planner_out = hf_chat(model_id, msgs, max_new_tokens=300, temperature=0.2)
+            except Exception as e:
+                steps.append({"role": "error", "content": f"LLM call failed: {e}"})
                 break
-
+            
+            steps.append({"role": "assistant", "content": planner_out, "step": step})
+            parsed = _extract_json_block(planner_out)
+            
+            # Handle thought (reflection)
+            if parsed.get("thought"):
+                thought = parsed.get("thought", "")
+                steps.append({"role": "thought", "content": thought, "step": step})
+                ctx.add_interaction(planner_out, f"Thought noted: {thought[:100]}")
+                continue
+            
+            # Handle stop
+            if parsed.get("stop") is True:
+                reason = parsed.get("reason", "planner decided to stop")
+                steps.append({"role": "stop", "content": reason, "step": step})
+                break
+            
+            # Handle tool call
             tool = parsed.get("tool")
-            tool_inp = parsed.get("input","")
-            if tool not in TOOLS:
-                # Tell planner it was invalid and continue
-                msgs.append({"role":"assistant","content": planner_out})
-                msgs.append({"role":"user","content": json.dumps({"note": f"Invalid or missing tool. Try another tool or stop."})})
-                no_new_ctr += 1
-                if no_new_ctr >= stagnation_patience:
+            tool_inp_raw = parsed.get("input", "")
+            
+            # Convert input to string if it's a dict
+            if isinstance(tool_inp_raw, dict):
+                tool_inp = json.dumps(tool_inp_raw)
+            else:
+                tool_inp = str(tool_inp_raw)
+            
+            if not tool or tool not in TOOLS:
+                invalid_call_count += 1
+                error_msg = f"Invalid tool call. Available: {', '.join(TOOLS.keys())}. You said: {tool}"
+                steps.append({"role": "error", "content": error_msg, "step": step})
+                ctx.add_interaction(planner_out, error_msg)
+                
+                if invalid_call_count >= max_invalid:
+                    steps.append({"role": "stop", "content": "Too many invalid tool calls, stopping", "step": step})
                     break
                 continue
-
+            
             # Execute tool
             try:
                 with trace(f"tool:{tool}", run_type="tool", inputs={"input": tool_inp}) as tspan:
                     result = TOOLS[tool](tool_inp)
                     tspan.outputs = {"result": result}
             except Exception as e:
-                result = {"error": f"{tool} failed: {e}"}
-
-            obs = json.dumps(result, ensure_ascii=False)
-            steps.append({"role":"tool","tool":tool,"content": _summarize_text_for_obs(obs)})
-
-            # Aggregate evidence
+                result = {"error": f"{tool} execution failed: {str(e)[:200]}"}
+            
+            # Aggregate evidence and track quality
             added = 0
-            if tool == "web_search" and "results" in result:
-                added += ev.add_search(result["results"])
-            elif tool == "read_url" and "text" in result:
-                added += ev.add_page(result)
-            elif tool == "rag_retrieve" and "results" in result:
-                added += ev.add_rag(result["results"])
-
-            total_added += added
-            no_new_ctr = 0 if added > 0 else no_new_ctr + 1
-
-            # Feed observation back to planner
-            msgs.append({"role":"assistant","content": planner_out})
-            msgs.append({"role":"user","content": f"Observation:\n{_summarize_text_for_obs(obs)}\nConsider next step. If you have enough, return stop."})
-
-            if no_new_ctr >= stagnation_patience:
+            quality_note = ""
+            
+            if "error" in result:
+                # Tool failed - provide guidance
+                error_msg = result["error"]
+                suggestion = result.get("suggestion", "")
+                obs = f"Tool {tool} failed: {error_msg}\n{suggestion}"
+                no_evidence_count += 1
+            else:
+                # Tool succeeded
+                if tool == "web_search" and "results" in result:
+                    added = ev.add_search(result["results"])
+                    quality_note = result.get("summary", f"Added {added} web results")
+                elif tool == "read_url" and "text" in result:
+                    added = ev.add_page(result)
+                    quality_note = result.get("summary", f"Added {added} page")
+                elif tool == "rag_retrieve" and "results" in result:
+                    added = ev.add_rag(result["results"])
+                    avg_score = result.get("avg_score", 0.0)
+                    quality_note = f"Added {added} RAG chunks (avg quality: {avg_score:.2f})"
+                    
+                    # Smart fallback: if RAG quality is low, suggest web search
+                    if avg_score < 0.3 and added > 0:
+                        quality_note += "\nNOTE: Low RAG relevance. Consider web_search for this topic."
+                
+                obs = quality_note if quality_note else json.dumps(result, ensure_ascii=False)[:800]
+                
+                if added == 0:
+                    no_evidence_count += 1
+                else:
+                    no_evidence_count = 0  # Reset on success
+            
+            # Track tool usage
+            ev.add_tool_call(tool, tool_inp, result, added)
+            
+            steps.append({
+                "role": "tool",
+                "tool": tool,
+                "content": _summarize_text(obs, 900),
+                "added": added,
+                "step": step
+            })
+            
+            ctx.add_interaction(planner_out, obs)
+            
+            # Check stopping conditions
+            if no_evidence_count >= max_no_evidence:
+                steps.append({"role": "stop", "content": "No new evidence from recent attempts, stopping", "step": step})
                 break
-
-    # Final synthesis with COMPLETE evidence bundle
-    context_text, cites = ev.context_pack(max_chars=16000)
-    cite_lines = "\n".join([f"- [{c['title']}]({c['url']})" for c in cites if c.get("url")])
-    final_sys = (
-        f"{scenario_sys}\n"
-        "You will now answer the user's question using ONLY the provided EVIDENCE below. "
-        "Be concise, factual, and cite claims with [n] markers that map to the Sources list. "
-        "If evidence is insufficient or ambiguous, say so and explain what else would be needed.\n"
-    )
-    final_user = (
-        f"USER QUESTION:\n{user_input}\n\n"
-        f"EVIDENCE:\n{context_text}\n\n"
-        "Write the final answer with inline [n] citations and conclude with a 'Sources' list."
-    )
-    final_answer = hf_chat(
-        model_id,
-        [
-            {"role":"system","content": final_sys},
-            {"role":"user","content": final_user}
-        ],
-        max_new_tokens=700,
-        temperature=0.3
-    )
-    if cite_lines:
-        final_answer += "\n\n**Sources:**\n" + cite_lines
-
+            
+            # Auto-suggest stop if we have good evidence
+            total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
+            if total_evidence >= 8 and step >= 4:
+                suggestion = f"\nYou have {total_evidence} pieces of evidence. Consider if this is sufficient to answer the question."
+                ctx.add_interaction("", suggestion)
+    
+    # Final synthesis with complete evidence
+    context_text, cites = ev.context_pack(max_chars=18000)
+    
+    if not context_text or len(context_text) < 100:
+        # No evidence gathered
+        final_answer = (
+            "I apologize, but I was unable to gather sufficient evidence to answer your question. "
+            "The available sources did not contain relevant information. "
+            "This could mean:\n"
+            "- The topic is outside the scope of my curated corpus\n"
+            "- Web search did not return authoritative results\n"
+            "- The question may need to be rephrased for better results\n\n"
+            "Please try rephrasing your question or ask about a related topic."
+        )
+    else:
+        # Build citation reference
+        cite_lines = "\n".join([f"[{i+1}] [{c['title']}]({c['url']})" for i, c in enumerate(cites)])
+        
+        final_sys = (
+            f"{scenario_sys}\n\n"
+            "You are now providing the final answer based on gathered evidence. "
+            "CRITICAL RULES:\n"
+            "- Use ONLY information from the EVIDENCE section below\n"
+            "- Cite specific claims with [n] markers matching the source numbers\n"
+            "- Be concise but comprehensive\n"
+            "- If evidence is contradictory, acknowledge different perspectives\n"
+            "- If evidence is insufficient for certain aspects, explicitly state what's missing\n"
+            "- Provide actionable insights when possible\n"
+        )
+        
+        final_user = (
+            f"USER QUESTION:\n{user_input}\n\n"
+            f"EVIDENCE (from {len(cites)} sources):\n{context_text}\n\n"
+            "Provide a clear, well-structured answer with inline [n] citations. "
+            "Be helpful and educational, focusing on practical takeaways."
+        )
+        
+        try:
+            with trace("final_synthesis", run_type="llm", inputs={"context_length": len(context_text), "num_sources": len(cites)}):
+                final_answer = hf_chat(
+                    model_id,
+                    [
+                        {"role": "system", "content": final_sys},
+                        {"role": "user", "content": final_user}
+                    ],
+                    max_new_tokens=800,
+                    temperature=0.3
+                )
+        except Exception as e:
+            final_answer = f"Error generating final answer: {e}\n\nEvidence was gathered but synthesis failed."
+        
+        # Append sources
+        if cite_lines:
+            final_answer += "\n\n---\n**Sources:**\n" + cite_lines
+    
     return final_answer, steps
 
 # =========================
-# Sidebar
+# Sidebar Configuration
 # =========================
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Configuration")
+    
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
-    model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
-    max_steps = st.slider("Max planning/tool steps", 1, 12, 8)
-    stagnation_patience = st.slider("No-new-evidence patience", 1, 5, 3)
+    model_id = st.selectbox("HF Model", HF_MODELS, index=0)
+    
+    st.markdown("---")
+    st.subheader("🤖 Agent Settings")
+    max_steps = st.slider("Max planning steps", 3, 15, 10, help="Maximum tool calls before forcing stop")
+    reflection_interval = st.slider("Reflection interval", 2, 5, 3, help="Planner reflects every N steps")
+    
     st.markdown("---")
     st.subheader("📚 RAG Corpus")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Build/Refresh RAG Index", use_container_width=True):
+    
+    if st.button("🔄 Rebuild RAG Index", use_container_width=True):
+        with st.spinner("Rebuilding RAG index..."):
             try:
                 idx, side = build_rag_index(DOC_LINKS)
                 _global_rag["index"], _global_rag["side"] = idx, side
-                st.success(f"RAG index built: {side['vectors_shape'][0]} chunks.")
+                st.success(f"✅ RAG index rebuilt: {side['vectors_shape'][0]} chunks from {len(DOC_LINKS)} sources")
             except Exception as e:
-                st.error(f"RAG build failed: {e}")
-    with c2:
-        st.caption("Curated sources; top-k=7 + reranking. Planner decides if/when to use RAG.")
-
-st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
+                st.error(f"❌ RAG build failed: {e}")
+    
+    if _global_rag["index"] is not None:
+        st.info(f"📊 Index: {_global_rag['side']['vectors_shape'][0]} chunks ready")
+    
+    st.markdown("---")
+    st.caption(f"**Model:** {model_id.split('/')[-1]}")
+    st.caption(f"**Scenario:** {scenario_name}")
 
 # =========================
-# Chat UI
+# Main Chat Interface
 # =========================
+st.markdown("---")
+st.subheader("💬 Intelligent Tutor Chat")
+st.caption("The agent decides which tools to use based on your question. It starts with RAG for concepts, falls back to web search if needed, and can fetch full articles.")
+
+# Initialize chat
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role":"system","content":SCENARIOS[scenario_name]["system"]},
-        {"role":"assistant","content":"Hi! I’m GenAI-Tutor. Ask me anything about Gen-AI."}
+        {"role": "assistant", "content": "👋 Hi! I'm GenAI-Tutor with an intelligent agentic system.\n\nI can:\n- 📚 Search curated Gen-AI educational content (RAG)\n- 🌐 Search the web for recent information\n- 📄 Fetch and read full articles\n\nI automatically choose the best approach based on your question. Ask me anything!"}
     ]
+    st.session_state.scenario_prev = scenario_name
+
 if "scenario_prev" not in st.session_state:
     st.session_state.scenario_prev = scenario_name
 
-def _seed_chat():
-    st.session_state.messages = [
-        {"role":"system","content":SCENARIOS[scenario_name]["system"]},
-        {"role":"assistant","content":"Hi! I’m GenAI-Tutor. Ask me anything about Gen-AI."}
-    ]
-
+# Reset chat if scenario changed
 if st.session_state.scenario_prev != scenario_name:
-    _seed_chat(); st.session_state.scenario_prev = scenario_name
+    st.session_state.messages = [
+        {"role": "assistant", "content": f"📚 Switched to **{scenario_name}** scenario.\n\n{SCENARIOS[scenario_name]['overview']}\n\nWhat would you like to learn?"}
+    ]
+    st.session_state.scenario_prev = scenario_name
 
-st.markdown("---")
-st.subheader("💬 Tutor Chat (Planner tools → Final Synthesis)")
+# Render chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# render history
-for m in st.session_state.messages:
-    with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
-        st.markdown(m["content"])
+# Chat input
+user_query = st.chat_input("Ask about Gen-AI, prompt engineering, ethics, or current AI news...")
 
-user_q = st.chat_input("Ask a question. The planner may use RAG, Web Search, or ReadURL, then synthesize.")
-if user_q:
-    st.session_state.messages.append({"role":"user","content":user_q})
-    with tracing_context(project_name=LS_PROJECT, metadata={"type":"agent_turn","scenario":scenario_name,"model":model_id}):
-        with trace("agent_turn", run_type="chain", inputs={"question": user_q, "max_steps": max_steps, "stagnation_patience": stagnation_patience}):
-            with st.chat_message("assistant"):
-                with st.spinner("Planning with tools → synthesizing…"):
-                    try:
+if user_query:
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": user_query})
+    with st.chat_message("user"):
+        st.markdown(user_query)
+    
+    # Run agent
+    with st.chat_message("assistant"):
+        with st.spinner("🤔 Planning strategy and gathering evidence..."):
+            try:
+                with tracing_context(
+                    project_name=LS_PROJECT,
+                    metadata={
+                        "type": "agent_conversation",
+                        "scenario": scenario_name,
+                        "model": model_id,
+                        "max_steps": max_steps
+                    }
+                ):
+                    with trace("agent_turn", run_type="chain", inputs={"question": user_query, "scenario": scenario_name}):
                         answer, step_trace = run_agent(
-                            user_input=user_q,
+                            user_input=user_query,
                             model_id=model_id,
                             scenario_sys=SCENARIOS[scenario_name]["system"],
                             max_steps=max_steps,
-                            stagnation_patience=stagnation_patience
+                            reflection_interval=reflection_interval
                         )
-                    except Exception as e:
-                        answer, step_trace = f"⚠️ Agent failed: {e}", []
-
-                st.markdown(answer)
-                if step_trace:
-                    with st.expander("🔍 Planner Trace (tool JSON + observations)"):
-                        for i, step in enumerate(step_trace, start=1):
-                            if step.get("role") == "assistant":
-                                st.markdown(f"**Step {i}: Planner JSON**")
-                                st.code(step["content"], language="json")
-                            elif step.get("role") == "tool":
-                                st.markdown(f"**Step {i}: Tool `{step.get('tool')}` observation**")
-                                st.text_area("Observation", value=step["content"], height=160, key=f"obs_{i}_{step.get('tool')}")
-
-    st.session_state.messages.append({"role":"assistant","content":answer})
+            except Exception as e:
+                answer = f"⚠️ **Agent Error**\n\nThe agentic system encountered an error: {str(e)}\n\nPlease try rephrasing your question."
+                step_trace = []
+        
+        # Display answer
+        st.markdown(answer)
+        
+        # Show agent trace
+        if step_trace:
+            with st.expander("🔍 Agent Reasoning Trace (Click to expand)", expanded=False):
+                st.caption("See how the agent decided which tools to use and what evidence it gathered.")
+                
+                for i, step in enumerate(step_trace, start=1):
+                    step_num = step.get("step", i)
+                    
+                    if step.get("role") == "assistant":
+                        st.markdown(f"**Step {step_num}: 🧠 Planner Decision**")
+                        st.code(step["content"], language="json")
+                    
+                    elif step.get("role") == "thought":
+                        st.markdown(f"**Step {step_num}: 💭 Reflection**")
+                        st.info(step["content"])
+                    
+                    elif step.get("role") == "tool":
+                        tool_name = step.get("tool", "unknown")
+                        added = step.get("added", 0)
+                        emoji = "📚" if tool_name == "rag_retrieve" else "🌐" if tool_name == "web_search" else "📄"
+                        st.markdown(f"**Step {step_num}: {emoji} Tool: `{tool_name}` → Added {added} items**")
+                        st.text_area(
+                            "Result",
+                            value=step["content"],
+                            height=150,
+                            key=f"tool_{step_num}_{tool_name}_{i}",
+                            disabled=True
+                        )
+                    
+                    elif step.get("role") == "error":
+                        st.markdown(f"**Step {step_num}: ⚠️ Error**")
+                        st.error(step["content"])
+                    
+                    elif step.get("role") == "stop":
+                        st.markdown(f"**Step {step_num}: 🛑 Planning Complete**")
+                        st.success(step["content"])
+                
+                st.divider()
+                st.caption(f"Total steps: {len(step_trace)} | Agent used intelligent tool selection based on context")
+    
+    # Save to history
+    st.session_state.messages.append({"role": "assistant", "content": answer})
 
 # =========================
-# Scenario Overview
+# Information Panel
 # =========================
 st.markdown("---")
-st.subheader("📌 Scenario Overview")
-st.markdown(f"**{scenario_name}**  \n{SCENARIOS[scenario_name]['overview']}")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("📌 Current Scenario")
+    st.markdown(f"**{scenario_name}**")
+    st.caption(SCENARIOS[scenario_name]['overview'])
+
+with col2:
+    st.subheader("🤖 Agent Capabilities")
+    st.markdown("""
+    **Smart Tool Selection:**
+    - 📚 Starts with RAG for educational concepts
+    - 🌐 Falls back to web search if RAG quality is low
+    - 📄 Fetches full articles when needed
+    - 💭 Reflects on progress every few steps
+    - 🎯 Stops when sufficient evidence gathered
+    """)
+
+# =========================
+# Example Questions
+# =========================
+st.markdown("---")
+st.subheader("💡 Try These Questions")
+
+example_cols = st.columns(3)
+
+with example_cols[0]:
+    st.markdown("**📚 Conceptual (uses RAG)**")
+    if st.button("What is prompt engineering?", use_container_width=True):
+        st.session_state.messages.append({"role": "user", "content": "What is prompt engineering and what are the key techniques?"})
+        st.rerun()
+
+with example_cols[1]:
+    st.markdown("**🌐 Current Info (uses Web)**")
+    if st.button("Latest GPT-4 features?", use_container_width=True):
+        st.session_state.messages.append({"role": "user", "content": "What are the latest features of GPT-4 and its variants?"})
+        st.rerun()
+
+with example_cols[2]:
+    st.markdown("**🔀 Hybrid (uses both)**")
+    if st.button("AI in education ethics", use_container_width=True):
+        st.session_state.messages.append({"role": "user", "content": "What are the ethical considerations of using AI in education?"})
+        st.rerun()
 
 # =========================
 # Footer
 # =========================
 st.markdown("---")
-st.caption("GenAI-Tutor is educational. Verify critical info. Follow your organization’s policies.")
+st.caption("⚠️ **Educational Use Only** • Verify critical information • Follow your organization's AI policies")
+st.caption(f"🔧 Powered by: {model_id} | LangSmith tracing enabled | RAG + Web Search + Agentic Planning")

@@ -21,7 +21,7 @@ from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 # =========================
 # Reduce noisy inotify/health-check issues in hosted Linux environments
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
-st.set_option("server.fileWatcherType", "none")
+# st.set_option("server.fileWatcherType", "none")
 
 st.set_page_config(page_title="GenAI-Tutor (Robust Agentic)", layout="wide")
 st.markdown("<h1>🎓 GenAI-Tutor — Robust Agentic System</h1>", unsafe_allow_html=True)

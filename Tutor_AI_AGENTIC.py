@@ -1,18 +1,7 @@
-# app.py
-# GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith
-# (Hardened: deterministic URL picking from search hits, auto-follow read_url, fixed reflection interval)
+# GenAI-Tutor — Robust Agentic System with Smart Tool Selection + RAG + Web + LangSmith (Hardened)
 
-import os, io, re, json, hashlib, requests, time, logging
+import os, io, re, json, hashlib, time, requests
 from typing import List, Dict, Any, Tuple, Optional
-
-# --- Disable Streamlit file watcher early (fixes inotify limits) ---
-os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
-# Optional: reduce misc telemetry
-os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
-
-# Silence Tornado access logs (hides GET /script-health-check console spam)
-for _name in ("tornado.access", "tornado.application", "tornado.general"):
-    logging.getLogger(_name).setLevel(logging.ERROR)
 
 import numpy as np
 import streamlit as st
@@ -20,29 +9,26 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient
-from requests.exceptions import HTTPError, RequestException
-try:
-    from huggingface_hub import InferenceTimeoutError as HFTimeout  # optional on newer hub
-except Exception:
-    HFTimeout = None
 
 from langsmith import Client
 from langsmith.run_helpers import tracing_context, trace
 
-# Free web search via LangChain DuckDuckGo
+# LangChain DuckDuckGo web search (free)
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
 # =========================
-# Streamlit & Secrets
+# Streamlit & runtime hygiene
 # =========================
-st.set_page_config(page_title="GenAI-Tutor (Robust Agentic)", layout="wide")
-try:
-    st.set_option("server.fileWatcherType", "none")
-except Exception:
-    pass
+# Reduce noisy inotify/health-check issues in hosted Linux environments
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+st.set_option("server.fileWatcherType", "none")
 
+st.set_page_config(page_title="GenAI-Tutor (Robust Agentic)", layout="wide")
 st.markdown("<h1>🎓 GenAI-Tutor — Robust Agentic System</h1>", unsafe_allow_html=True)
 
+# =========================
+# Secrets & API Keys
+# =========================
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     st.error("Missing HF token. Add HF_TOKEN in Streamlit Secrets.")
@@ -64,7 +50,6 @@ HF_MODELS = [
     "google/gemma-2-9b-it",
     "Qwen/Qwen2.5-7B-Instruct",
 ]
-SAFE_FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"  # used only if chosen model errors repeatedly
 
 SCENARIOS: Dict[str, Dict[str, str]] = {
     "Gen-AI Fundamentals": {
@@ -105,7 +90,7 @@ TOP_K = 7
 K_CANDIDATES = 30
 WORDS_PER_CHUNK = 450
 OVERLAP_WORDS = 80
-MIN_RERANK_SCORE = 0.05  # permissive
+MIN_RERANK_SCORE = 0.05  # permissive to avoid empty returns
 
 @st.cache_data(show_spinner=False)
 def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
@@ -146,7 +131,7 @@ def chunk_text(text: str, url: str, title: str) -> List[Dict[str, Any]]:
     if not text: return []
     words = text.split()
     if len(words) < 100:
-        return []  # skip ultra-short sources
+        return []
     chunks, start, k = [], 0, 0
     while start < len(words):
         end = min(start+WORDS_PER_CHUNK, len(words))
@@ -171,11 +156,21 @@ def embed_texts(texts: List[str], model):
 
 @st.cache_resource(show_spinner=True)
 def build_faiss(vectors: np.ndarray):
-    import faiss  # may fail on some hosts
-    d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(vectors)
-    return index
+    try:
+        import faiss
+        d = vectors.shape[1]
+        index = faiss.IndexFlatIP(d)
+        index.add(vectors)
+        return index
+    except Exception:
+        class NpIndex:
+            def __init__(self, V): self.V = V
+            def search(self, qv, k):
+                sims = (qv @ self.V.T)
+                idxs = np.argsort(-sims, axis=1)[:, :k]
+                scores = np.take_along_axis(sims, idxs, axis=1)
+                return scores, idxs
+        return NpIndex(vectors)
 
 @st.cache_resource(show_spinner=True)
 def build_rag_index(doc_links: List[Dict[str, Any]]):
@@ -191,18 +186,7 @@ def build_rag_index(doc_links: List[Dict[str, Any]]):
     if not all_chunks:
         raise RuntimeError("No chunks ingested from sources (all empty/blocked).")
     vectors = embed_texts([c["text"] for c in all_chunks], embedder)
-    # Try FAISS; otherwise fallback to NumPy search
-    try:
-        index = build_faiss(vectors)
-    except Exception:
-        class NpIndex:
-            def __init__(self, V): self.V = V
-            def search(self, qv, k):
-                sims = (qv @ self.V.T)
-                idxs = np.argsort(-sims, axis=1)[:, :k]
-                scores = np.take_along_axis(sims, idxs, axis=1)
-                return scores, idxs
-        index = NpIndex(vectors)
+    index = build_faiss(vectors)
     side = {"chunks": all_chunks, "vectors_shape": vectors.shape}
     return index, side
 
@@ -220,11 +204,9 @@ def retrieve(query: str, index, side: Dict[str, Any], top_k: int = TOP_K) -> Tup
     try:
         pairs = [(query, c["text"]) for c in candidates]
         rers = reranker.predict(pairs, batch_size=64).tolist()
-        for c, rs in zip(candidates, rers):
-            c["score_rerank"] = float(rs)
+        for c, rs in zip(candidates, rers): c["score_rerank"] = float(rs)
     except Exception:
-        for c in candidates:
-            c["score_rerank"] = float(c["score_ann"])
+        for c in candidates: c["score_rerank"] = float(c["score_ann"])
 
     quality_results = [c for c in candidates if c["score_rerank"] >= MIN_RERANK_SCORE]
     if not quality_results:
@@ -234,7 +216,7 @@ def retrieve(query: str, index, side: Dict[str, Any], top_k: int = TOP_K) -> Tup
     avg_score = sum(c["score_rerank"] for c in sorted_results) / len(sorted_results)
     return sorted_results, avg_score
 
-# Lazy RAG (no import-time build)
+# Lazy RAG
 _global_rag = {"index": None, "side": None}
 def ensure_rag_ready():
     if _global_rag["index"] is None or _global_rag["side"] is None:
@@ -242,39 +224,50 @@ def ensure_rag_ready():
         _global_rag["index"], _global_rag["side"] = idx, side
 
 # =========================
-# Web search (LangChain DuckDuckGo) — per call, no hardcoding
+# Web search via LangChain DuckDuckGo (fresh per call)
 # =========================
-def web_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
-    """
-    Free web search via LangChain DuckDuckGo wrapper.
-    - Fresh wrapper per call (avoids stale state)
-    - No brand/model rewrites or hardcoded sites
-    - Simple retry once on transient errors
-    """
-    if not query or len(query.strip()) < 3:
-        return []
-    wrapper = DuckDuckGoSearchAPIWrapper(region="us-en", time="y", max_results=max_results)
-
-    def _once(q: str) -> List[Dict[str, str]]:
-        items = wrapper.results(q, max_results=max_results) or []
-        out: List[Dict[str, str]] = []
-        for r in items:
-            title = (r.get("title") or "").strip()
-            url = (r.get("link") or "").strip()
-            snippet = (r.get("snippet") or "").strip()
-            if title and url:
-                out.append({"title": title[:160], "url": url, "snippet": snippet[:400]})
+def lc_duckduckgo_search(query: str, max_results: int = 8) -> List[Dict[str, str]]:
+    results = []
+    def _query(q) -> List[Dict[str, str]]:
+        wrapper = DuckDuckGoSearchAPIWrapper()  # create per call
+        hits = wrapper.results(q, max_results=max_results)
+        out = []
+        for h in hits or []:
+            # LangChain format: {'title':..., 'link':..., 'snippet':...}
+            url = h.get("link") or h.get("url") or ""
+            title = h.get("title") or ""
+            snippet = h.get("snippet") or ""
+            if title and url and url.startswith("http"):
+                out.append({"title": title, "url": url, "snippet": snippet})
         return out
 
     try:
-        res = _once(query)
+        results = _query(query)
     except Exception:
-        time.sleep(1.0)
-        res = _once(query)
-    return res
+        results = []
+    if not results and len(query.split()) >= 3:
+        # A very light broadening retry (no brand/site hardcoding)
+        q2 = re.sub(r"\b(202[0-9])\b", "", query).strip()
+        q2 = re.sub(r"\s{2,}", " ", q2)
+        try:
+            results = _query(q2) if q2 and q2 != query else []
+        except Exception:
+            results = []
+    return results
+
+# deterministic top URLs for auto-follow
+def pick_top_urls_from_hits(hits: List[Dict[str, str]], n: int = 2) -> List[str]:
+    urls = []
+    for h in hits:
+        u = (h.get("url") or "").strip()
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+        if len(urls) >= n:
+            break
+    return urls
 
 # =========================
-# Improved JSON Parsing
+# JSON helpers
 # =========================
 def _extract_json_block(text: str) -> Dict[str, Any]:
     try:
@@ -315,121 +308,145 @@ def _summarize_text(s: str, limit: int = 800) -> str:
     return s[:limit] + ("…" if len(s) > limit else "")
 
 # =========================
-# Tools with Quality Checks (structure preserved)
+# Tools with Quality Checks
 # =========================
 def tool_web_search(inp: Any) -> Dict[str, Any]:
     if isinstance(inp, dict):
         data = inp
     elif isinstance(inp, str):
-        if inp.strip().startswith("{"):
-            data = _extract_json_block(inp)
-        else:
-            data = {}
+        data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     else:
         data = {}
-
     query = data.get("query") or (inp if isinstance(inp, str) else "").strip()
     max_results = int(data.get("max_results", 8)) if str(data.get("max_results","")).isdigit() else 8
-
     if not query or len(query) < 3:
         return {"error": "Empty or too short search query"}
+    query = str(query).strip('"').strip("'")
 
-    res = web_search(query, max_results=max_results)
-    if not res:
+    hits = lc_duckduckgo_search(query, max_results=max_results)
+    if not hits:
         return {
             "error": f"No web results found for: {query}",
-            "suggestion": "Try broader keywords or use rag_retrieve for conceptual topics"
+            "suggestion": "Try simpler keywords or a related term, or provide a direct URL."
         }
-    # Important: summary uses the actual query
-    return {"results": res, "summary": f"Found {len(res)} web results for '{(query or '').strip()}'"}
+    return {"results": hits, "summary": f"Found {len(hits)} web results for '{query}'"}
 
 def tool_read_url(inp: Any) -> Dict[str, Any]:
     if isinstance(inp, dict):
         data = inp
     elif isinstance(inp, str):
-        if inp.strip().startswith("{"):
-            data = _extract_json_block(inp)
-        else:
-            data = {}
+        data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     else:
         data = {}
+
     url = data.get("url") or (inp if isinstance(inp, str) else "").strip()
     max_chars = int(data.get("max_chars", 8000)) if str(data.get("max_chars","")).isdigit() else 8000
     url = str(url).strip('"').strip("'")
     if not url.startswith("http"):
         return {"error": "Invalid URL format (must start with http:// or https://)"}
 
-    headers = {"User-Agent":"TutorAI/2.0 (+https://example.com) Mozilla/5.0"}
-    for attempt in (1, 2):  # one retry
+    headers_primary = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    def _fetch(u: str) -> Tuple[Optional[str], Optional[int], Optional[bytes], Optional[str]]:
         try:
-            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
-            r.raise_for_status()
+            r = requests.get(u, headers=headers_primary, timeout=25, allow_redirects=True)
             ctype = (r.headers.get("Content-Type","")).lower()
-            if "pdf" in ctype or url.lower().endswith(".pdf"):
-                text = _clean_pdf(r.content)
+            status = r.status_code
+            if status >= 400:
+                return None, status, None, None
+            return ctype, status, r.content, r.url
+        except requests.RequestException:
+            return None, None, None, None
+
+    # Primary tries (once + retry)
+    for attempt in (1, 2):
+        ctype, status, content, final_url = _fetch(url)
+        if content is not None:
+            try:
+                if "pdf" in (ctype or "") or (final_url or url).lower().endswith(".pdf"):
+                    text = _clean_pdf(content)
+                else:
+                    text = _clean_html(content)
                 if not text or len(text) < 50:
-                    return {"error": f"PDF text extraction was empty for {url}",
-                            "suggestion": "This PDF may be scanned or blocked. Try an HTML version or another source."}
-            else:
-                text = _clean_html(r.content)
-            if not text or len(text) < 50:
-                return {"error": f"No meaningful content extracted from {url}"}
-            text_trimmed = text[:max_chars]
-            return {
-                "title": url.split("/")[-1][:100],
-                "url": url,
-                "text": text_trimmed,
-                "char_count": len(text_trimmed),
-                "summary": f"Extracted {len(text_trimmed)} chars from {url}"
-            }
-        except requests.RequestException as e:
+                    return {"error": f"No meaningful content extracted from {final_url or url}"}
+                text_trimmed = text[:max_chars]
+                return {
+                    "title": (final_url or url).split("/")[-1][:100],
+                    "url": (final_url or url),
+                    "text": text_trimmed,
+                    "char_count": len(text_trimmed),
+                    "summary": f"Extracted {len(text_trimmed)} chars from {final_url or url}"
+                }
+            except Exception as e:
+                if attempt == 2:
+                    return {"error": f"Failed to process content from {final_url or url}: {str(e)[:120]}"}
+        else:
             if attempt == 2:
-                return {"error": f"Failed to fetch {url}: {str(e)[:120]}"}
-            time.sleep(0.8)
-        except Exception as e:
-            if attempt == 2:
-                return {"error": f"Failed to process {url}: {str(e)[:120]}"}
-            time.sleep(0.8)
+                # Generic reader snapshot fallback (domain-agnostic)
+                proxy = f"https://r.jina.ai/{url}"
+                p_ctype, p_status, p_content, p_final = _fetch(proxy)
+                if p_content is not None:
+                    try:
+                        text = p_content.decode("utf-8", errors="ignore")
+                        if not text or len(text) < 50:
+                            return {"error": f"No meaningful content extracted via reader for {url}"}
+                        text_trimmed = text[:max_chars]
+                        return {
+                            "title": (p_final or proxy).split("/")[-1][:100],
+                            "url": url,  # keep original URL canonical
+                            "text": text_trimmed,
+                            "char_count": len(text_trimmed),
+                            "summary": f"Extracted {len(text_trimmed)} chars via reader for {url}"
+                        }
+                    except Exception as e:
+                        dom = re.sub(r'^https?://', '', url).split('/')[0]
+                        return {"error": f"Reader fallback failed for {url}: {str(e)[:120]}", "domain": dom, "http_status": p_status}
+                dom = re.sub(r'^https?://', '', url).split('/')[0]
+                return {"error": f"Failed to fetch {url}: HTTP {status or 'unknown'}", "http_status": status, "domain": dom}
+
+    dom = re.sub(r'^https?://', '', url).split('/')[0]
+    return {"error": f"Failed to fetch {url}: unknown error", "domain": dom}
 
 def tool_rag_retrieve(inp: Any) -> Dict[str, Any]:
     try:
         ensure_rag_ready()
     except Exception as e:
         return {"error": f"RAG index unavailable: {e}", "suggestion": "Use web_search instead"}
-
     if isinstance(inp, dict):
         data = inp
     elif isinstance(inp, str):
-        if inp.strip().startswith("{"):
-            data = _extract_json_block(inp)
-        else:
-            data = {}
+        data = _extract_json_block(inp) if inp.strip().startswith("{") else {}
     else:
         data = {}
-
     q = data.get("query") or (inp if isinstance(inp, str) else "").strip()
     q = str(q).strip('"').strip("'")
     if not q or len(q) < 3:
         return {"error": "Empty or too short RAG query"}
-
     try:
         k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
     except:
         k = TOP_K
-
     results, avg_score = retrieve(q, _global_rag["index"], _global_rag["side"], top_k=k)
     if not results:
         return {"error": f"No relevant content in RAG corpus for: {q}",
                 "suggestion": "Topic may be outside corpus scope. Try web_search for broader coverage.",
                 "avg_score": 0.0}
-
     out = [{
         "title": c["title"],
         "url": c["url"],
         "chunk": c["text"][:900],
         "score": round(c.get("score_rerank", 0.0), 3)
     } for c in results]
-
     if avg_score >= 0.5: quality_note = " (HIGH quality - good match)"
     elif avg_score >= 0.3: quality_note = " (MEDIUM quality - acceptable)"
     else: quality_note = " (LOW quality - consider web_search)"
@@ -445,7 +462,7 @@ TOOLS = {
 TOOL_DESCRIPTIONS = """
 Available tools:
 1. rag_retrieve: Search curated Gen-AI education corpus (best for: fundamental concepts, pedagogical approaches, ethical considerations, established best practices)
-2. web_search: Search the internet (best for: recent news, current pricing, product updates, latest research, real-time information)
+2. web_search: Search the internet (best for: recent news, product updates, latest research, real-time information)
 3. read_url: Fetch and read content from a specific URL (use after web_search to get full article content)
 
 Tool selection strategy:
@@ -455,50 +472,38 @@ Tool selection strategy:
 - If RAG returns LOW quality (< 0.3) or error, immediately switch to web_search
 - Use web_search for time-sensitive queries (news, pricing, product features)
 - After web_search, use read_url on the most promising 1-2 URLs for depth
-- Avoid redundant calls: don't search the same query twice with different phrasing
+- Avoid redundant calls: don't search the same query twice with the same phrasing
 - STOP when you have 5+ high-quality pieces of evidence OR all strategies exhausted
 """
 
 # =========================
-# HF chat wrapper (kept structure, hardened)
+# HF chat wrapper (robust)
 # =========================
 def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, temperature=0.0, top_p=0.9) -> str:
-    def _call(mdl: str, mx: int) -> str:
-        client = InferenceClient(model=mdl, token=HF_TOKEN)
-        resp = client.chat_completion(
-            messages=messages,
-            max_tokens=mx,
-            temperature=temperature,
-            top_p=top_p,
-            stop=["```", "\n\nObservation:", "\n\nUser:"],  # harmless if unsupported
-        )
-        choice = resp.choices[0]
-        msg = getattr(choice, "message", None) or choice["message"]
-        content = getattr(msg, "content", None) or msg["content"]
-        return (content or "").strip()
-
-    # Attempt 1
-    try:
-        return _call(model, max_new_tokens)
-    except Exception as e:
-        # Retry on timeouts/request errors with smaller output
-        is_timeout_like = ((HFTimeout is not None and isinstance(e, HFTimeout)) or
-                           isinstance(e, (RequestException, HTTPError)))
-        if is_timeout_like:
-            try:
-                return _call(model, max(max_new_tokens // 2, 128))
-            except Exception:
-                pass
-        # Fallback model as last resort
+    client = InferenceClient(model=model, token=HF_TOKEN)
+    # one retry path with reduced tokens on error
+    for attempt in (1, 2):
         try:
-            if model != SAFE_FALLBACK_MODEL:
-                return _call(SAFE_FALLBACK_MODEL, max(max_new_tokens // 2, 128))
+            resp = client.chat_completion(
+                messages=messages,
+                max_tokens=max_new_tokens if attempt == 1 else max(256, max_new_tokens // 2),
+                temperature=temperature,
+                top_p=top_p,
+                stop=["```", "\n\nObservation:", "\n\nUser:"],
+            )
+            choice = resp.choices[0]
+            msg = getattr(choice, "message", None) or choice["message"]
+            content = getattr(msg, "content", None) or msg["content"]
+            return (content or "").strip()
         except Exception:
-            pass
-        raise
+            if attempt == 2:
+                # fallback minimal notice
+                return '{"thought":"model_call_failed","stop":true,"reason":"llm_error"}'
+            time.sleep(0.5)
+    return '{"stop": true, "reason":"unreachable"}'
 
 # =========================
-# Enhanced Controller System
+# Controller System (unchanged format)
 # =========================
 def controller_system_text(scenario_sys: str) -> str:
     return f"""{scenario_sys}
@@ -536,7 +541,7 @@ No thoughts or stops before the first tool call.
 """
 
 # =========================
-# Evidence Store + URL picking helper
+# Evidence Store with blocked-domain memory
 # =========================
 class EvidenceStore:
     def __init__(self):
@@ -546,6 +551,16 @@ class EvidenceStore:
         self.seen_urls = set()
         self.seen_hashes = set()
         self.tool_history: List[Dict[str, Any]] = []
+        self.blocked_domains: Dict[str, int] = {}   # NEW
+        self.failed_urls: set[str] = set()          # NEW
+
+    def note_block(self, domain: str):
+        if not domain: return
+        self.blocked_domains[domain] = self.blocked_domains.get(domain, 0) + 1
+
+    def is_blocked(self, url: str) -> bool:
+        dom = re.sub(r'^https?://', '', url).split('/')[0]
+        return self.blocked_domains.get(dom, 0) >= 1 or (url in self.failed_urls)
 
     def add_tool_call(self, tool: str, inp: Any, result: Dict[str, Any], added: int):
         self.tool_history.append({
@@ -635,17 +650,6 @@ class EvidenceStore:
             text = text[:max_chars] + "\n[Evidence truncated due to length]"
         return text, citations
 
-def pick_top_urls_from_hits(hits: List[Dict[str, str]], n: int = 2) -> List[str]:
-    """Deterministic selection from actual search hits (prevents fabricated URLs)."""
-    urls: List[str] = []
-    for h in hits:
-        u = (h.get("url") or "").strip()
-        if u.startswith("http") and u not in urls:
-            urls.append(u)
-        if len(urls) >= n:
-            break
-    return urls
-
 # =========================
 # Sliding Context Window
 # =========================
@@ -678,14 +682,14 @@ class SlidingContext:
         return msgs
 
 # =========================
-# Robust Agent with Smart Tool Selection (reflection interval fixed to 3)
+# Agent loop (reflection interval fixed to 3 in backend)
 # =========================
 def run_agent(
     user_input: str,
     model_id: str,
     scenario_sys: str,
     max_steps: int = 10,
-    reflection_interval: int = 3  # fixed; UI no longer changes this
+    reflection_interval: int = 3  # fixed
 ) -> Tuple[str, List[Dict[str, Any]]]:
     steps = []
     ev = EvidenceStore()
@@ -709,7 +713,7 @@ Recent tools used: {', '.join(recent_tools)}
 Critical questions:
 1. Do you have sufficient HIGH-QUALITY evidence to answer the user's question?
 2. If RAG returned good results (score >= 0.5), why are you still searching?
-3. If web_search keeps failing, have you tried simpler keywords?
+3. If web_search keeps failing, have you tried simpler/broader keywords?
 4. Are you repeating the same unsuccessful strategy?
 
 Decision: Return {{"thought": "..."}} with your assessment, then either:
@@ -731,6 +735,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
             if not parsed or not any(k in parsed for k in ("tool","stop","thought")):
                 parsed = _force_last_json(planner_out)
 
+            # If still nothing, run a safe default tool once
             if not parsed or not any(k in parsed for k in ("tool","stop","thought")):
                 heuristic_tool = "rag_retrieve"
                 tool_inp = {"query": user_input, "top_k": TOP_K}
@@ -762,17 +767,20 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                         break
                     continue
 
+            # Handle thought
             if parsed.get("thought"):
                 thought = parsed.get("thought", "")
                 steps.append({"role": "thought", "content": thought, "step": step})
                 ctx.add_interaction(planner_out, f"Thought noted: {thought[:100]}")
                 continue
 
+            # Handle stop
             if parsed.get("stop") is True:
                 reason = parsed.get("reason", "planner decided to stop")
                 steps.append({"role": "stop", "content": reason, "step": step})
                 break
 
+            # Handle tool call
             tool = parsed.get("tool")
             tool_inp = parsed.get("input", "")
 
@@ -786,6 +794,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                     break
                 continue
 
+            # Execute tool
             try:
                 with trace(f"tool:{tool}", run_type="tool", inputs={"input": tool_inp}) as tspan:
                     result = TOOLS[tool](tool_inp)
@@ -801,25 +810,41 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                 error_msg = result["error"]
                 suggestion = result.get("suggestion", "")
                 obs = f"❌ {tool} failed: {error_msg}\n" + (f"💡 {suggestion}" if suggestion else "")
+                # If read_url error includes domain, remember to avoid re-hitting in this turn
+                dom = result.get("domain")
+                if dom:
+                    ev.note_block(dom)
+                url_failed = None
+                if isinstance(tool_inp, dict):
+                    url_failed = tool_inp.get("url")
+                if url_failed:
+                    ev.failed_urls.add(url_failed)
                 no_evidence_count += 1
+
             else:
                 if tool == "web_search" and "results" in result:
-                    # Add search hits
                     added = ev.add_search(result["results"])
                     quality_note = result.get("summary", f"Added {added} web results")
 
-                    # NEW: deterministically auto-follow top 1–2 URLs from actual hits (prevents fabricated URLs)
-                    top_urls = pick_top_urls_from_hits(result["results"], n=2)
-                    # Let planner see the URLs list (nudges it to reuse these)
+                    # Show preview to the planner
                     preview = "\n".join(f"- {h['title'][:80]} :: {h['url']}" for h in result["results"][:5])
                     ctx.add_interaction('{"tool":"web_search","input":{}}', f"Top search URLs:\n{preview}")
 
+                    # Deterministic auto-follow top 1–2 URLs, skipping blocked domains
+                    top_urls = pick_top_urls_from_hits(result["results"], n=2)
                     for u in top_urls:
+                        if ev.is_blocked(u):
+                            steps.append({"role":"tool","tool":"read_url","content":f"Skip auto-follow for blocked domain URL: {u}", "added":0, "step":step})
+                            continue
                         try:
                             with trace("tool:read_url(auto_follow)", run_type="tool", inputs={"input": {"url": u, "max_chars": 8000}}) as tspan2:
                                 r2 = TOOLS["read_url"]({"url": u, "max_chars": 8000})
                                 tspan2.outputs = {"result": r2}
                             if "error" in r2:
+                                dom2 = r2.get("domain")
+                                if dom2:
+                                    ev.note_block(dom2)
+                                ev.failed_urls.add(u)
                                 steps.append({"role":"tool","tool":"read_url","content":_summarize_text(f"Auto-follow failed: {r2['error']}",900),"added":0,"step":step})
                             else:
                                 added_page = ev.add_page(r2)
@@ -844,7 +869,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
                         quality_note += "\n⚠️ LOW quality - try web_search for better results."
 
                 obs = quality_note if quality_note else json.dumps(result, ensure_ascii=False)[:800]
-                if added == 0 and tool != "web_search":  # web_search adds snippets; pages added separately
+                if added == 0:
                     no_evidence_count += 1
                 else:
                     no_evidence_count = 0
@@ -853,6 +878,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
             steps.append({"role": "tool", "tool": tool, "content": _summarize_text(obs, 900), "added": added, "step": step})
             ctx.add_interaction(planner_out, obs)
 
+            # stopping checks
             if no_evidence_count >= max_no_evidence:
                 steps.append({"role": "stop", "content": "Multiple tools returned no evidence. Stopping to synthesize what we have.", "step": step})
                 break
@@ -862,6 +888,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
 
     # Final synthesis
     context_text, cites = ev.context_pack(max_chars=18000)
+    total_evidence = len(ev.rag_chunks) + len(ev.pages) + len(ev.search_hits)
 
     if not context_text or len(context_text) < 100:
         final_answer = (
@@ -887,6 +914,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
             "- If evidence conflicts, acknowledge it\n"
             "- Note gaps explicitly if evidence is missing\n"
             "- Provide actionable insights when possible\n"
+            "- Do NOT invent numbers (e.g., pricing) that are not explicitly present in the EVIDENCE.\n"
         )
         final_user = (
             f"USER QUESTION:\n{user_input}\n\n"
@@ -909,7 +937,7 @@ Decision: Return {{"thought": "..."}} with your assessment, then either:
     return final_answer, steps
 
 # =========================
-# Sidebar Configuration (reflection interval removed from UI)
+# Sidebar Configuration (reflection removed from UI)
 # =========================
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -989,7 +1017,7 @@ if user_query:
                             model_id=model_id,
                             scenario_sys=SCENARIOS[scenario_name]["system"],
                             max_steps=max_steps,
-                            reflection_interval=3  # fixed here too
+                            reflection_interval=3  # fixed in backend
                         )
             except Exception as e:
                 answer = f"⚠️ **Agent Error**\n\nThe agentic system encountered an error: {str(e)}\n\nPlease try rephrasing your question."
@@ -1043,7 +1071,7 @@ with col2:
     - 📚 Starts with RAG for educational concepts
     - 🌐 Falls back to web search if RAG quality is low
     - 📄 Fetches full articles when needed
-    - 💭 Reflects on progress every few steps
+    - 💭 Reflects on progress every few steps (interval fixed to 3)
     - 🎯 Stops when sufficient evidence gathered
     """)
 
@@ -1060,8 +1088,8 @@ with example_cols[0]:
         st.rerun()
 with example_cols[1]:
     st.markdown("**🌐 Current Info (uses Web)**")
-    if st.button("Latest GPT-4 features?", use_container_width=True):
-        st.session_state.messages.append({"role": "user", "content": "What are the latest features of GPT-4 and its variants?"})
+    if st.button("Latest multimodal model updates?", use_container_width=True):
+        st.session_state.messages.append({"role": "user", "content": "What are the latest multimodal model updates?"})
         st.rerun()
 with example_cols[2]:
     st.markdown("**🔀 Hybrid (uses both)**")

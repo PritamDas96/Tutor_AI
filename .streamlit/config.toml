@@ -1,3 +1,6 @@
+# .streamlit/config.toml
 [server]
 fileWatcherType = "none"
-runOnSave = false
+
+[browser]
+gatherUsageStats = false

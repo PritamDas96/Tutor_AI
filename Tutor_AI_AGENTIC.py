@@ -1,5 +1,5 @@
 # app.py
-# GenAI-Tutor — Agentic (JSON Controller + Router) + RAG + Tools + LangSmith (HF-only)
+# GenAI-Tutor — Agentic (Router + JSON Controller) + RAG + Web Research + LangSmith (HF-only)
 
 import os, io, json, re, hashlib, requests
 from typing import List, Dict, Any, Tuple
@@ -8,7 +8,7 @@ import numpy as np
 import streamlit as st
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
-from duckduckgo_search import DDGS
+from ddgs import DDGS  # duckduckgo_search renamed -> ddgs
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from huggingface_hub import InferenceClient
 
@@ -19,8 +19,8 @@ from langsmith.run_helpers import tracing_context, trace, get_current_run_tree
 # =========================
 # Streamlit & Secrets
 # =========================
-st.set_page_config(page_title="GenAI-Tutor (Agentic + RAG)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Agentic + RAG (HF-only, JSON controller + router)</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor (Agentic + RAG + Web)", layout="wide")
+st.markdown("<h1>🎓 GenAI-Tutor — Agentic (HF-only) with RAG + Web Research</h1>", unsafe_allow_html=True)
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -61,7 +61,7 @@ SCENARIOS: Dict[str, Dict[str, str]] = {
 SCENARIO_NAMES = list(SCENARIOS.keys())
 
 # =========================
-# RAG corpus (public)
+# RAG corpus (curated, public)
 # =========================
 DOC_LINKS = [
     {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
@@ -191,10 +191,30 @@ def ensure_rag_ready():
         _global_rag["index"], _global_rag["side"] = idx, side
 
 # =========================
-# Tool helpers & tools
+# Web search utilities (ddgs)
+# =========================
+@st.cache_resource(show_spinner=False)
+def get_ddg():
+    return DDGS()  # cached
+
+def web_search(query: str, max_results: int = 5, region: str = "wt-wt", lang: str = "en") -> List[Dict[str, str]]:
+    results = []
+    try:
+        ddg = get_ddg()
+        for r in ddg.text(keywords=query, max_results=max_results, region=region, safesearch="moderate"):
+            title = r.get("title") or ""
+            url = r.get("href") or r.get("url") or ""
+            snippet = r.get("body") or ""
+            if title and url:
+                results.append({"title": title, "url": url, "snippet": snippet})
+    except Exception:
+        return []
+    return results
+
+# =========================
+# Tools
 # =========================
 def _extract_json_block(text: str) -> Dict[str, Any]:
-    # Return the first {...} JSON object in text, if any
     try:
         m = re.search(r"\{.*\}", text, flags=re.S)
     except re.error:
@@ -214,30 +234,19 @@ def _extract_json_block(text: str) -> Dict[str, Any]:
 def _summarize_text_for_obs(s: str, limit: int = 1200) -> str:
     return s[:limit] + ("…" if len(s) > limit else "")
 
-def web_search(query: str, max_results: int = 5, region: str = "wt-wt", lang: str = "en") -> List[Dict[str, str]]:
-    results = []
-    with DDGS() as ddg:
-        for r in ddg.text(query, max_results=max_results, region=region, safesearch="moderate", backend="api"):
-            title = r.get("title") or ""
-            url = r.get("href") or r.get("url") or ""
-            snippet = r.get("body") or ""
-            if title and url:
-                results.append({"title": title, "url": url, "snippet": snippet})
-    return results
-
 def tool_web_search(inp: str) -> Dict[str, Any]:
     """Search the web. Input: natural language or JSON {query,max_results,region,lang}. Output: {'results': [...]} or {'note': ...}"""
     data = _extract_json_block(inp) or {}
     query = data.get("query") or inp.strip()
-    max_results = int(data.get("max_results", 5)) if str(data.get("max_results","")).isdigit() else 5
+    max_results = int(data.get("max_results", 6)) if str(data.get("max_results","")).isdigit() else 6
     region = data.get("region","wt-wt"); lang = data.get("lang","en")
 
     res = web_search(query, max_results=max_results, region=region, lang=lang)
     if not res:
-        if "gen ai" in query.lower() or "genai" in query.lower():
+        if any(k in query.lower() for k in ["gen ai", "genai", "generative ai"]):
             query2 = "what is generative ai definition site:ibm.com OR site:nvidia.com OR site:microsoft.com"
         else:
-            query2 = query + " definition"
+            query2 = query + " site:arxiv.org OR site:nature.com OR site:aclanthology.org OR site:research.google"
         res = web_search(query2, max_results=max_results, region="wt-wt", lang="en")
     return {"results": res} if res else {"note": "No results found. Consider rephrasing the query."}
 
@@ -245,7 +254,7 @@ def tool_read_url(inp: str) -> Dict[str, Any]:
     """Read a URL (HTML or PDF). Input: URL or JSON {url,max_chars}. Output: {'title','url','text'}"""
     data = _extract_json_block(inp) or {}
     url = data.get("url") or inp.strip()
-    max_chars = int(data.get("max_chars", 6000)) if str(data.get("max_chars","")).isdigit() else 6000
+    max_chars = int(data.get("max_chars", 7000)) if str(data.get("max_chars","")).isdigit() else 7000
     try:
         r = requests.get(url, headers={"User-Agent":"TutorAI/1.0"}, timeout=25)
         r.raise_for_status()
@@ -282,7 +291,7 @@ TOOLS = {
 }
 
 # =========================
-# HF chat wrapper
+# HF chat wrapper (HF-only)
 # =========================
 def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, temperature=0.3, top_p=0.9) -> str:
     client = InferenceClient(model=model, token=HF_TOKEN)
@@ -295,8 +304,16 @@ def hf_chat(model: str, messages: List[Dict[str,str]], max_new_tokens=512, tempe
 # =========================
 # Router + Answerability
 # =========================
+RECENCY_HINT_WORDS = ["latest", "today", "yesterday", "this week", "this month", "2024", "2025", "paper", "preprint", "blog", "news", "release", "recent"]
+
+def looks_recent(user_input: str) -> bool:
+    s = user_input.lower()
+    return any(w in s for w in RECENCY_HINT_WORDS)
+
 def classify_route(user_input: str, model_id: str, prefer_web: bool = False) -> str:
-    """Return 'rag' | 'web' | 'direct'."""
+    """Return 'rag' | 'web' | 'direct' with heuristics and an LLM vote."""
+    if looks_recent(user_input):  # heuristic override for newsy queries
+        return "web"
     sys = (
         "Classify the best route to answer.\n"
         "Return ONLY one token: rag | web | direct.\n"
@@ -313,10 +330,12 @@ def classify_route(user_input: str, model_id: str, prefer_web: bool = False) -> 
     if "web" in out: return "web"
     if "rag" in out: return "rag"
     if "direct" in out: return "direct"
-    return "rag"
+    return "web" if prefer_web else "rag"
 
 def can_answer_direct(user_input: str, model_id: str) -> bool:
     """Yes/No if the model can answer confidently without tools."""
+    if looks_recent(user_input):  # don't try direct if recency likely
+        return False
     sys = (
         "Answer with YES or NO only.\n"
         "YES if you can confidently answer the question without external tools.\n"
@@ -331,26 +350,28 @@ def can_answer_direct(user_input: str, model_id: str) -> bool:
 # =========================
 # JSON Controller System Prompt
 # =========================
-CONTROLLER_SYSTEM = (
-    "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
-    "You can call tools or produce a final answer.\n"
-    "Available tools (call names exactly): rag_retrieve, web_search, read_url.\n\n"
-    "RETURN FORMAT (MUST be a single JSON object, no trailing text):\n"
-    "1) To call a tool:\n"
-    '{  "tool": "rag_retrieve" | "web_search" | "read_url",  "input": "<single string>" }\n'
-    "2) To finalize:\n"
-    '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."} ] }\n\n'
-    "Notes:\n"
-    "- Use the provided Route hint: if route=rag, call rag_retrieve first; if route=web, call web_search then read_url; if direct, finalize without tools.\n"
-    "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
-    "- Prefer rag_retrieve for Gen-AI learning topics; then at most one web_search.\n"
-    "- Cite sources you relied on. Keep answers concise and factual.\n"
-)
+def controller_system_text(scenario_sys: str) -> str:
+    return (
+        "You are GenAI-Tutor, a safe, practical Gen-AI coach.\n"
+        f"Scenario guidance: {scenario_sys}\n"
+        "You can call tools or produce a final answer.\n"
+        "Available tools (call names exactly): rag_retrieve, web_search, read_url.\n\n"
+        "RETURN FORMAT (MUST be a single JSON object, no trailing text):\n"
+        "1) To call a tool:\n"
+        '{  "tool": "rag_retrieve" | "web_search" | "read_url",  "input": "<single string>" }\n'
+        "2) To finalize:\n"
+        '{  "final_answer": "<your answer text>",  "citations": [ {"title": "...", "url": "..."} ] }\n\n'
+        "Notes:\n"
+        "- Use the provided Route hint: if route=rag, call rag_retrieve first; if route=web, call web_search then read_url; if direct, finalize without tools.\n"
+        "- If two tool calls return empty or notes, finalize with best effort and state limitations.\n"
+        "- Prefer 2–3 diverse sources for general questions.\n"
+        "- Cite sources you relied on. Keep answers concise and factual.\n"
+    )
 
 # =========================
 # Agent Controller
 # =========================
-def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
+def run_agent(user_input: str, model_id: str, scenario_sys: str, max_steps: int, prefer_web: bool = False) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Returns (final_answer, trace_steps)
     trace_steps: list of {role, content} and tool observations for debug panel.
@@ -359,11 +380,12 @@ def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool =
     citations_pool: List[Dict[str,str]] = []
     empty_hits = 0
 
-    # 0) Try direct answer quickly
+    # 0) Try direct answer quickly (unless recency suspected)
     try:
         if can_answer_direct(user_input, model_id):
             direct = hf_chat(model_id, [
-                {"role":"system","content":"Answer clearly and concisely. Cite reliable sources if you know them."},
+                {"role":"system","content":"Answer clearly and concisely."},
+                {"role":"system","content": scenario_sys},
                 {"role":"user","content": user_input}
             ], max_new_tokens=512, temperature=0.3)
             return direct, steps
@@ -374,10 +396,12 @@ def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool =
     try:
         route = classify_route(user_input, model_id, prefer_web=prefer_web)
     except Exception:
-        route = "rag"
+        route = "web" if looks_recent(user_input) else "rag"
 
-    controller_msgs = [{"role":"system","content": CONTROLLER_SYSTEM}]
-    controller_msgs.append({"role":"user","content": f"Route: {route}\nUser question: {user_input}"})
+    controller_msgs = [
+        {"role":"system","content": controller_system_text(scenario_sys)},
+        {"role":"user","content": f"Route: {route}\nUser question: {user_input}"}
+    ]
 
     for step in range(1, max_steps+1):
         with trace("controller_step", run_type="chain", inputs={"step": step, "route": route}):
@@ -388,6 +412,7 @@ def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool =
             if not parsed:
                 final = hf_chat(model_id, [
                     {"role":"system","content":"Answer the user's question clearly and concisely, without tools."},
+                    {"role":"system","content": scenario_sys},
                     {"role":"user","content": user_input}
                 ], max_new_tokens=512, temperature=0.3)
                 return final, steps
@@ -450,9 +475,8 @@ def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool =
             controller_msgs.append({"role":"assistant","content": raw})
             controller_msgs.append({"role":"user","content": f"Observation:\n{_summarize_text_for_obs(obs_str)}\n\nReturn the next JSON. If sufficient, finalize."})
 
-            # Early stop: enough sources gathered
-            if len({c.get('url') for c in citations_pool if c.get('url')}) >= 2:
-                # Encourage finalize
+            # Early stop: enough sources gathered (2+ unique)
+            if len({c.get('url') for c in citations_pool if c.get('url')}) >= 2 and route != "web":
                 controller_msgs.append({"role":"user","content":"You have enough evidence (2+ sources). Finalize now."})
 
             if empty_hits >= 2:
@@ -461,6 +485,7 @@ def run_agent(user_input: str, model_id: str, max_steps: int, prefer_web: bool =
     # Force finalize if loop exits without explicit final
     final = hf_chat(model_id, [
         {"role":"system","content":"Answer the user's question clearly and concisely. If sources exist, cite them."},
+        {"role":"system","content": scenario_sys},
         {"role":"user","content": user_input}
     ], max_new_tokens=512, temperature=0.3)
     if citations_pool:
@@ -480,7 +505,7 @@ with st.sidebar:
     scenario_name = st.selectbox("Learning Scenario", SCENARIOS.keys(), index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
     max_steps = st.slider("Max tool calls per turn", 1, 10, 6)
-    prefer_web = st.checkbox("Prefer Web for ambiguous queries", value=False)
+    prefer_web = st.checkbox("Prefer Web for ambiguous queries", value=True)
     st.markdown("---")
     st.subheader("📚 RAG Corpus")
     c1, c2 = st.columns(2)
@@ -493,7 +518,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"RAG build failed: {e}")
     with c2:
-        st.caption("Uses curated sources; top-k=7 with reranking.")
+        st.caption("Curated sources; top-k=7 + reranking.")
 st.caption(f"Model: **{model_id}**  •  Scenario: **{scenario_name}**")
 
 # =========================
@@ -516,7 +541,7 @@ if st.session_state.scenario_prev != scenario_name:
     _seed_chat(); st.session_state.scenario_prev = scenario_name
 
 st.markdown("---")
-st.subheader("💬 Tutor Chat (Agentic JSON + Router)")
+st.subheader("💬 Tutor Chat (Agentic Router: Direct / RAG / Web)")
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"] if m["role"] in ["user","assistant"] else "assistant"):
@@ -530,7 +555,7 @@ if user_q:
             with st.chat_message("assistant"):
                 with st.spinner("Thinking with tools…"):
                     try:
-                        answer, step_trace = run_agent(user_q, model_id, max_steps=max_steps, prefer_web=prefer_web)
+                        answer, step_trace = run_agent(user_q, model_id, SCENARIOS[scenario_name]["system"], max_steps=max_steps, prefer_web=prefer_web)
                     except Exception as e:
                         answer, step_trace = f"⚠️ Agent failed: {e}", []
 

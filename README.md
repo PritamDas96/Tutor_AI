@@ -12,7 +12,6 @@
 ![RAG](https://img.shields.io/badge/RAG-FAISS%20%2B%20Reranker-005571)
 ![LangChain](https://img.shields.io/badge/LangChain-Agentic-1C3C3C?logo=langchain&logoColor=white)
 ![LangSmith](https://img.shields.io/badge/LangSmith-Observability-00A67E)
-![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
 
@@ -367,14 +366,5 @@ Contributions are welcome. Please open an issue to discuss significant changes f
 
 ---
 
-## 📄 License & Disclaimer
-
-Released under the **MIT License** (add a `LICENSE` file if not present).
-
-> **Educational use only.** GenAI-Tutor provides learning assistance and may produce inaccuracies. Verify critical information and follow your organization's security, privacy and compliance policies. Do not enter confidential data or PII.
-
-<div align="center">
-
-*Built with ❤️ using Streamlit, Hugging Face, FAISS and LangChain.*
 
 </div>

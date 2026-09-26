@@ -38,8 +38,10 @@ from langchain_huggingface import HuggingFaceEmbeddings as LcHfEmbeddings  # <--
 # ===========================
 # App Config & Secrets
 # ===========================
-st.set_page_config(page_title="GenAI-Tutor (RAG + Observability)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Intelligent Conversational Learning Assistant</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor | RAG + Observability", layout="wide", initial_sidebar_state="expanded")
+from ui import inject_css, hero, status_bar, footer
+inject_css()
+hero("Version 3 : RAG + Observability Edition")
 
 HF_TOKEN = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
@@ -49,19 +51,34 @@ if not HF_TOKEN:
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = os.environ.get("HUGGINGFACEHUB_API_TOKEN", HF_TOKEN)
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
-os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
 LS_PROJECT = st.secrets.get("LANGSMITH_PROJECT", os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-RAG"))
+
+# Only enable LangSmith tracing when an API key is actually present; otherwise the
+# explicit tracing_context()/trace() blocks force uploads that 401-spam the logs.
+_LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY", "").strip())
+if _LS_ENABLED:
+    os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
+else:
+    os.environ["LANGSMITH_TRACING"] = "false"
+    import types
+    from contextlib import contextmanager
+    @contextmanager
+    def _ls_noop(*args, **kwargs):
+        yield types.SimpleNamespace(outputs=None, inputs=None,
+                                    id="00000000-0000-0000-0000-000000000000")
+    tracing_context = _ls_noop  # shadow the imported names with no-ops
+    trace = _ls_noop
 ls_client = Client()
 
 # ===========================
 # HF Chat Models (open-source)
 # ===========================
 HF_MODELS = [
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "google/gemma-2-9b-it",
-    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "deepseek-ai/DeepSeek-V3-0324",
 ]
 
 # ===========================
@@ -103,11 +120,25 @@ SCENARIO_NAMES = list(SCENARIOS.keys())
 # Sidebar (ONLY two dropdowns)
 # ===========================
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Configuration")
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
     st.caption("HF token & LangSmith settings come from Secrets.")
-st.caption(f"Model in use: **{model_id}**  •  Scenario: **{scenario_name}**")
+    with st.expander("About this version"):
+        st.write(
+            "Version 3 (RAG + Observability). The RAG tutor plus production tooling: "
+            "LangSmith tracing of every turn, thumbs up/down feedback, and a RAGAS "
+            "panel scoring faithfulness and answer relevancy."
+        )
+
+# Status bar under the header
+_rag_on = st.session_state.get("use_rag", True)
+status_bar([
+    (f"Model: <b>{model_id.split('/')[-1]}</b>", ""),
+    (f"Scenario: <b>{scenario_name}</b>", ""),
+    (("RAG: On", "mode") if _rag_on else ("RAG: Off", "")),
+    (("LangSmith: On", "ok") if _LS_ENABLED else ("LangSmith: Off", "")),
+])
 
 # ===========================
 # Session State
@@ -162,177 +193,18 @@ def call_hf_chat(model: str,
     raise RuntimeError(f"Chat completion failed for {model}: {last_err}")
 
 # ============================================================
-#                         RAG CORE
+#                    RAG CORE (shared module: rag_core.py)
 # ============================================================
-TOP_K = 7
-K_CANDIDATES = 30
-WORDS_PER_CHUNK = 450
-OVERLAP_WORDS = 80
-
-DOC_LINKS = [
-    {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
-     "url": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2025.1565938/full", "enabled": True},
-    {"title": "Learn Your Way: Reimagining Textbooks with Generative AI (2025) — Google",
-     "url": "https://blog.google/outreach-initiatives/education/learn-your-way/", "enabled": True},
-    {"title": "Student Generative AI Survey 2025 — HEPI",
-     "url": "https://www.hepi.ac.uk/reports/student-generative-ai-survey-2025/", "enabled": True},
-    {"title": "Educational impacts of generative AI on learning & performance (2025) — Nature (PDF)",
-     "url": "https://www.nature.com/articles/s41598-025-06930-w.pdf", "enabled": True},
-    {"title": "Enhancing Retrieval-Augmented Generation: Best Practices — COLING 2025 (PDF)",
-     "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
-]
-
-@st.cache_data(show_spinner=False)
-def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    return r.content, (r.headers.get("Content-Type", "")).lower()
-
-def _clean_html(html_bytes: bytes) -> str:
-    try:
-        soup = BeautifulSoup(html_bytes, "html.parser")
-        for t in soup(["script", "style", "noscript", "header", "footer", "nav", "form"]):
-            t.decompose()
-        text = soup.get_text("\n")
-    except Exception:
-        text = html_bytes.decode("utf-8", errors="ignore")
-    lines = [ln.strip() for ln in text.splitlines()]
-    return "\n".join([ln for ln in lines if ln])
-
-def _clean_pdf(pdf_bytes: bytes) -> str:
-    text = []
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    for p in reader.pages:
-        try:
-            text.append(p.extract_text() or "")
-        except Exception:
-            text.append("")
-    lines = [ln.strip() for ln in "\n".join(text).splitlines()]
-    return "\n".join([ln for ln in lines if ln])
-
-def fetch_and_clean(url: str) -> str:
-    try:
-        blob, ctype = _download(url)
-        if ".pdf" in url.lower() or "application/pdf" in ctype:
-            return _clean_pdf(blob)
-        return _clean_html(blob)
-    except requests.HTTPError as he:
-        code = he.response.status_code if he.response is not None else "?"
-        st.info(f"Skipping (HTTP {code}): {url}")
-        return ""
-    except Exception as e:
-        st.info(f"Skipping (fetch error): {url} ({e})")
-        return ""
-
-def _to_words(text: str) -> List[str]:
-    return [w for w in text.replace("\u00a0", " ").split() if w]
-
-def chunk_text(text: str, url: str, title: str,
-               target_words: int = WORDS_PER_CHUNK, overlap_words: int = OVERLAP_WORDS) -> List[Dict[str, Any]]:
-    if not text:
-        return []
-    words = _to_words(text)
-    chunks, start, k = [], 0, 0
-    while start < len(words):
-        end = min(start + target_words, len(words))
-        piece = " ".join(words[start:end])
-        chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
-        chunks.append({"chunk_id": chunk_id, "title": title, "url": url, "text": piece})
-        if end == len(words):
-            break
-        start = max(0, end - overlap_words)
-        k += 1
-    return chunks
-
-@st.cache_resource(show_spinner=True)
-def load_embedder() -> SentenceTransformer:
-    return SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-@st.cache_resource(show_spinner=True)
-def load_reranker() -> CrossEncoder:
-    return CrossEncoder("BAAI/bge-reranker-v2-m3")
-
-def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
-    X = model.encode(texts, batch_size=64, normalize_embeddings=True, convert_to_numpy=True)
-    return X.astype("float32")
-
-@st.cache_resource(show_spinner=True)
-def build_faiss(vectors: np.ndarray):
-    import faiss
-    d = vectors.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(vectors)
-    return index
-
-@st.cache_resource(show_spinner=True)
-def build_rag_index(doc_links: List[Dict[str, Any]]):
-    embedder = load_embedder()
-    all_chunks: List[Dict[str, Any]] = []
-    for doc in doc_links:
-        if not doc.get("enabled", True):
-            continue
-        raw = fetch_and_clean(doc["url"])
-        if not raw:
-            continue
-        all_chunks.extend(chunk_text(raw, doc["url"], doc["title"]))
-    if not all_chunks:
-        raise RuntimeError("No chunks ingested from the selected sources.")
-    vectors = embed_texts([c["text"] for c in all_chunks], embedder)
-    index = build_faiss(vectors)
-    side = {"chunks": all_chunks, "vectors_shape": vectors.shape}
-    return index, side
-
-def refresh_rag_cache():
-    st.cache_resource.clear()
-    st.cache_data.clear()
+from rag_core import (
+    TOP_K, K_CANDIDATES, DOC_LINKS,
+    build_rag_index, refresh_rag_cache,
+    build_context_and_citations, rag_rules,
+    retrieve as _core_retrieve,
+)
 
 @traceable(run_type="retriever", name="retrieve", metadata={"top_k": TOP_K})
-def retrieve(query: str, index, side: Dict[str, Any],
-             top_k: int = TOP_K, k_candidates: int = K_CANDIDATES) -> List[Dict[str, Any]]:
-    import faiss  # noqa
-    embedder = load_embedder()
-    reranker = load_reranker()
-
-    qv = embed_texts([query], embedder)
-    scores, idx = index.search(qv, k_candidates)
-    cand_ids, cand_scores = idx[0].tolist(), scores[0].tolist()
-
-    candidates = []
-    for pos, (ci, s) in enumerate(zip(cand_ids, cand_scores)):
-        if ci < 0:
-            continue
-        c = side["chunks"][ci]
-        candidates.append({"rank_ann": pos + 1, "score_ann": float(s), **c})
-
-    if not candidates:
-        return []
-
-    pairs = [(query, c["text"]) for c in candidates]
-    rerank_scores = reranker.predict(pairs, batch_size=64).tolist()
-    for c, rs in zip(candidates, rerank_scores):
-        c["score_rerank"] = float(rs)
-    candidates.sort(key=lambda x: x["score_rerank"], reverse=True)
-    return candidates[:top_k]
-
-def build_context_and_citations(retrieved: List[Dict[str, Any]]) -> Tuple[str, str, List[Dict[str, Any]]]:
-    url_to_ref: Dict[str, int] = {}
-    refs: List[str] = []
-    blocks: List[str] = []
-    for c in retrieved:
-        u = c["url"]
-        if u not in url_to_ref:
-            url_to_ref[u] = len(url_to_ref) + 1
-            refs.append(f"[{url_to_ref[u]}] {u} — {c['title']}")
-        r = url_to_ref[u]
-        snippet = c["text"].strip()
-        snippet = (snippet[:800] + "…") if len(snippet) > 800 else snippet
-        blocks.append(f"[{r}] {c['title']}\n{snippet}\n")
-    return "\n\n".join(blocks), "\n".join(refs), retrieved
-
-def rag_rules() -> str:
-    return ("Use ONLY the provided CONTEXT. Cite like [1], [2] after claims tied to evidence. "
-            "If context is insufficient, say so and suggest which source to read. Do NOT invent URLs. "
-            "End with a 'Sources' list mapping [n] → URL.")
+def retrieve(query, index, side, top_k=TOP_K, k_candidates=K_CANDIDATES):
+    return _core_retrieve(query, index, side, top_k=top_k, k_candidates=k_candidates)
 
 # ===========================
 # Overview
@@ -417,7 +289,7 @@ with st.expander("📝 Personalized Study Notes (RAG-aware)", expanded=False):
                             f"goals: {goals_val}; pain points: {pains_val}; style: {style}; time/day: {time_per_day}."
                         )
                         with st.spinner("Retrieving evidence for your study notes…"):
-                            retrieved = retrieve(profile_query, index, side, top_k=TOP_K, k_candidates=K_CANDIDATES)
+                            retrieved, _ = retrieve(profile_query, index, side, top_k=TOP_K, k_candidates=K_CANDIDATES)
                         if not retrieved:
                             st.warning("No evidence retrieved; cannot create grounded notes.")
                         else:
@@ -469,7 +341,7 @@ with rc2:
         refresh_rag_cache()
         st.success("RAG caches cleared. Index will rebuild on next request.")
 with rc3:
-    st.caption("Uses 5 accessible sources; in-memory index; top-k=7 with reranking.")
+    st.caption("Uses a curated corpus; in-memory index; top-k=7 with reranking.")
 
 def get_rag_index():
     try:
@@ -506,7 +378,7 @@ if user_prompt:
                 index, side = get_rag_index()
                 if index is not None:
                     with st.spinner("Retrieving evidence…"):
-                        retrieved = retrieve(user_prompt, index, side, top_k=TOP_K, k_candidates=K_CANDIDATES)
+                        retrieved, _ = retrieve(user_prompt, index, side, top_k=TOP_K, k_candidates=K_CANDIDATES)
                     if retrieved:
                         ctx, srcs, evidence_to_show = build_context_and_citations(retrieved)
                         messages_for_call = [
@@ -588,8 +460,8 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                 # --- HF Judge (LangChain) ---
                 try:
                     endpoint = HuggingFaceEndpoint(
-                        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
-                        task="text-generation",
+                        repo_id="meta-llama/Llama-3.1-8B-Instruct",
+                        task="conversational",
                         huggingfacehub_api_token=os.environ["HUGGINGFACEHUB_API_TOKEN"],
                         max_new_tokens=256,
                         temperature=0.2,
@@ -620,27 +492,44 @@ with st.expander("🔬 Observe & Evaluate (RAGAS over recent chats)"):
                             embeddings=hf_emb,    # HF embeddings (no OpenAI)
                             show_progress=True,
                         )
-                    st.subheader("📈 RAGAS Results")
-                    try:
-                        st.write(scores)
-                    except Exception:
-                        st.json(scores)
+                    # Persist results so they survive the rerun triggered by the log button.
+                    st.session_state["ragas_scores"] = scores
+                    st.session_state["ragas_latest_run_id"] = turns[-1]["run_id"] if turns else ""
 
-                    # Optional logging to LangSmith (placeholders)
-                    if st.button("Log aggregate metric placeholders to LangSmith (latest run)"):
-                        try:
-                            latest_run_id = turns[-1]["run_id"] or None
-                            if not latest_run_id:
-                                st.info("No run_id to attach feedback.")
-                            else:
-                                for k in ["faithfulness", "answer_relevancy"]:
-                                    ls_client.create_feedback(run_id=latest_run_id, key=f"ragas_{k}", score=None)
-                                st.success("Logged placeholder RAGAS keys to LangSmith (customize if you want real aggregates).")
-                        except Exception as e:
-                            st.info(f"Feedback logging failed: {e}")
+    # Render last RAGAS results + logging button at TOP LEVEL (not nested inside the
+    # "Run RAGAS now" button block — a nested button never fires in Streamlit).
+    if st.session_state.get("ragas_scores") is not None:
+        st.subheader("📈 RAGAS Results")
+        try:
+            st.write(st.session_state["ragas_scores"])
+        except Exception:
+            st.json(st.session_state["ragas_scores"])
+
+        if st.button("Log RAGAS metrics to LangSmith (latest run)"):
+            try:
+                rid = st.session_state.get("ragas_latest_run_id") or None
+                if not rid:
+                    st.info("No run_id to attach feedback.")
+                else:
+                    scores_obj = st.session_state["ragas_scores"]
+                    logged = False
+                    # Prefer real aggregate means if the result exposes a dataframe.
+                    try:
+                        df = scores_obj.to_pandas()
+                        for k in ["faithfulness", "answer_relevancy"]:
+                            if k in df.columns:
+                                ls_client.create_feedback(run_id=rid, key=f"ragas_{k}", score=float(df[k].mean()))
+                                logged = True
+                    except Exception:
+                        pass
+                    if not logged:
+                        for k in ["faithfulness", "answer_relevancy"]:
+                            ls_client.create_feedback(run_id=rid, key=f"ragas_{k}", score=None)
+                    st.success("Logged RAGAS metrics to LangSmith.")
+            except Exception as e:
+                st.info(f"Feedback logging failed: {e}")
 
 # ===========================
 # Footer
 # ===========================
-st.markdown("---")
-st.caption("GenAI-Tutor is educational. Verify critical info. Follow your organization’s policies.")
+footer("GenAI-Tutor is educational. Verify critical information and follow your organization's policies.")

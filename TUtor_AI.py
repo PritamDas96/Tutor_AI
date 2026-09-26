@@ -21,18 +21,20 @@ from huggingface_hub import InferenceClient
 # ----------------------------
 # App Config & Header
 # ----------------------------
-st.set_page_config(page_title="GenAI-Tutor", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor – Intelligent Conversational Learning Assistant</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor | Chat", layout="wide", initial_sidebar_state="expanded")
+from ui import inject_css, hero, status_bar, footer
+inject_css()
+hero("Version 1 : Chatbot Edition")
 
 # ----------------------------
 # Open-Source Chat Models (HF)
 # ----------------------------
 HF_MODELS = [
-    "meta-llama/Meta-Llama-3-8B-Instruct",     # Meta license — accept on HF
-    "mistralai/Mistral-7B-Instruct-v0.2",      # Apache-2.0
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",    # Apache-2.0 (MoE)
-    "google/gemma-2-9b-it",                    # Gemma license — accept on HF
-    "Qwen/Qwen2.5-7B-Instruct",                # Qwen 2.5 license
+    "meta-llama/Llama-3.1-8B-Instruct",        # fast default (served via HF Inference Providers)
+    "meta-llama/Llama-3.3-70B-Instruct",       # large, high quality
+    "Qwen/Qwen2.5-72B-Instruct",               # large, high quality
+    "Qwen/Qwen2.5-Coder-32B-Instruct",         # strong reasoning
+    "deepseek-ai/DeepSeek-V3-0324",            # very capable
 ]
 
 GEN_DEFAULTS = dict(max_new_tokens=512, temperature=0.7, top_p=0.9)
@@ -136,15 +138,26 @@ RESOURCES: Dict[str, List[Dict[str, str]]] = {
 # Sidebar (ONLY two dropdowns)
 # ----------------------------
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Configuration")
     scenario_name = st.selectbox("Learning Scenario", SCENARIO_NAMES, index=0)
     model_id = st.selectbox("HF Model (chat)", HF_MODELS, index=0)
     # Token strictly from Secrets or env
     hf_token = st.secrets.get("HF_TOKEN") or os.environ.get("HF_TOKEN", "")
     st.caption("HF token is loaded from Secrets / env.")
+    with st.expander("About this version"):
+        st.write(
+            "Version 1 (Chatbot). A direct conversational tutor plus a personalized "
+            "study-notes generator with curated authoritative links. No retrieval; "
+            "answers rely on the model's own knowledge."
+        )
 
-# Model badge under title
-st.caption(f"Model in use: **{model_id}**  •  Scenario: **{scenario_name}**")
+# Status bar under the header
+status_bar([
+    (f"Model: <b>{model_id.split('/')[-1]}</b>", ""),
+    (f"Scenario: <b>{scenario_name}</b>", ""),
+    ("Mode: Chat", "mode"),
+    (("HF Connected", "ok") if hf_token else ("HF Token Missing", "off")),
+])
 
 # Warn if no token
 if not hf_token:
@@ -436,8 +449,7 @@ if user_prompt:
 # ----------------------------
 # Footer
 # ----------------------------
-st.markdown("---")
-st.caption(
-    "GenAI-Tutor provides educational assistance. Verify critical info. "
-    "Follow your organization’s security and compliance policies."
+footer(
+    "GenAI-Tutor provides educational assistance. Verify critical information and "
+    "follow your organization's security and compliance policies."
 )

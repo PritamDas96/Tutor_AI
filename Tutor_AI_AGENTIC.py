@@ -23,8 +23,10 @@ from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 # st.set_option("server.fileWatcherType", "none")
 
-st.set_page_config(page_title="GenAI-Tutor (Robust Agentic)", layout="wide")
-st.markdown("<h1>🎓 GenAI-Tutor — Robust Agentic System</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="GenAI-Tutor | Agentic", layout="wide", initial_sidebar_state="expanded")
+from ui import inject_css, hero, status_bar, footer
+inject_css()
+hero("Version 4 : Agentic Edition")
 
 # =========================
 # Secrets & API Keys
@@ -36,19 +38,34 @@ if not HF_TOKEN:
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = HF_TOKEN
 
 os.environ["LANGSMITH_API_KEY"] = st.secrets.get("LANGSMITH_API_KEY", os.environ.get("LANGSMITH_API_KEY", ""))
-os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
 LS_PROJECT = st.secrets.get("LANGSMITH_PROJECT", os.environ.get("LANGSMITH_PROJECT", "GenAI-Tutor-Agentic"))
+
+# Only enable LangSmith tracing when an API key is actually present; otherwise the
+# explicit tracing_context()/trace() blocks force uploads that 401-spam the logs.
+_LS_ENABLED = bool(os.environ.get("LANGSMITH_API_KEY", "").strip())
+if _LS_ENABLED:
+    os.environ["LANGSMITH_TRACING"] = str(st.secrets.get("LANGSMITH_TRACING", True)).lower()
+else:
+    os.environ["LANGSMITH_TRACING"] = "false"
+    import types
+    from contextlib import contextmanager
+    @contextmanager
+    def _ls_noop(*args, **kwargs):
+        yield types.SimpleNamespace(outputs=None, inputs=None,
+                                    id="00000000-0000-0000-0000-000000000000")
+    tracing_context = _ls_noop  # shadow the imported names with no-ops
+    trace = _ls_noop
 ls_client = Client()
 
 # =========================
 # Models & Scenarios
 # =========================
 HF_MODELS = [
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "google/gemma-2-9b-it",
-    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "deepseek-ai/DeepSeek-V3-0324",
 ]
 
 SCENARIOS: Dict[str, Dict[str, str]] = {
@@ -68,155 +85,14 @@ SCENARIOS: Dict[str, Dict[str, str]] = {
 SCENARIO_NAMES = list(SCENARIOS.keys())
 
 # =========================
-# RAG corpus (curated, public)
+# RAG (shared core: rag_core.py)
 # =========================
-DOC_LINKS = [
-    {"title": "Ethical & Regulatory Challenges of GenAI in Education (2025) — Frontiers",
-     "url": "https://www.frontiersin.org/journals/education/articles/10.3389/feduc.2025.1565938/full", "enabled": True},
-    {"title": "Learn Your Way: Reimagining Textbooks with Generative AI (2025) — Google",
-     "url": "https://blog.google/outreach-initiatives/education/learn-your-way/", "enabled": True},
-    {"title": "Student Generative AI Survey 2025 — HEPI",
-     "url": "https://www.hepi.ac.uk/reports/student-generative-ai-survey-2025/", "enabled": True},
-    {"title": "Educational impacts of generative AI on learning & performance (2025) — Nature (PDF)",
-     "url": "https://www.nature.com/articles/s41598-025-06930-w.pdf", "enabled": True},
-    {"title": "Enhancing Retrieval-Augmented Generation: Best Practices — COLING 2025 (PDF)",
-     "url": "https://aclanthology.org/2025.coling-main.449.pdf", "enabled": True},
-]
+from rag_core import (
+    DOC_LINKS, TOP_K, K_CANDIDATES, MIN_RERANK_SCORE,
+    build_rag_index, retrieve, _clean_html, _clean_pdf,
+)
 
-# =========================
-# RAG plumbing
-# =========================
-TOP_K = 7
-K_CANDIDATES = 30
-WORDS_PER_CHUNK = 450
-OVERLAP_WORDS = 80
-MIN_RERANK_SCORE = 0.05  # permissive to avoid empty returns
-
-@st.cache_data(show_spinner=False)
-def _download(url: str, timeout: int = 30) -> Tuple[bytes, str]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 TutorAI/2.0"})
-    r.raise_for_status()
-    return r.content, (r.headers.get("Content-Type", "")).lower()
-
-def _clean_html(html_bytes: bytes) -> str:
-    try:
-        soup = BeautifulSoup(html_bytes, "html.parser")
-        for t in soup(["script","style","noscript","header","footer","nav","form"]):
-            t.decompose()
-        text = soup.get_text("\n")
-    except Exception:
-        text = html_bytes.decode("utf-8", errors="ignore")
-    return "\n".join(ln.strip() for ln in text.splitlines() if ln.strip())
-
-def _clean_pdf(pdf_bytes: bytes) -> str:
-    pages = []
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    for p in reader.pages:
-        try:
-            pages.append(p.extract_text() or "")
-        except Exception:
-            pages.append("")
-    return "\n".join(ln.strip() for ln in "\n".join(pages).splitlines() if ln.strip())
-
-def fetch_and_clean(url: str) -> str:
-    try:
-        blob, ctype = _download(url)
-        if ".pdf" in url.lower() or "application/pdf" in ctype:
-            return _clean_pdf(blob)
-        return _clean_html(blob)
-    except Exception:
-        return ""
-
-def chunk_text(text: str, url: str, title: str) -> List[Dict[str, Any]]:
-    if not text: return []
-    words = text.split()
-    if len(words) < 100:
-        return []
-    chunks, start, k = [], 0, 0
-    while start < len(words):
-        end = min(start+WORDS_PER_CHUNK, len(words))
-        piece = " ".join(words[start:end])
-        chunk_id = f"{hashlib.sha1(url.encode()).hexdigest()}#{k:04d}"
-        chunks.append({"chunk_id":chunk_id,"title":title,"url":url,"text":piece})
-        if end == len(words): break
-        start = max(0, end-OVERLAP_WORDS); k += 1
-    return chunks
-
-@st.cache_resource(show_spinner=True)
-def load_embedder():
-    return SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-@st.cache_resource(show_spinner=True)
-def load_reranker():
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-def embed_texts(texts: List[str], model):
-    X = model.encode(texts, batch_size=64, normalize_embeddings=True, convert_to_numpy=True)
-    return X.astype("float32")
-
-@st.cache_resource(show_spinner=True)
-def build_faiss(vectors: np.ndarray):
-    try:
-        import faiss
-        d = vectors.shape[1]
-        index = faiss.IndexFlatIP(d)
-        index.add(vectors)
-        return index
-    except Exception:
-        class NpIndex:
-            def __init__(self, V): self.V = V
-            def search(self, qv, k):
-                sims = (qv @ self.V.T)
-                idxs = np.argsort(-sims, axis=1)[:, :k]
-                scores = np.take_along_axis(sims, idxs, axis=1)
-                return scores, idxs
-        return NpIndex(vectors)
-
-@st.cache_resource(show_spinner=True)
-def build_rag_index(doc_links: List[Dict[str, Any]]):
-    embedder = load_embedder()
-    all_chunks = []
-    for doc in doc_links:
-        if not doc.get("enabled", True):
-            continue
-        raw = fetch_and_clean(doc["url"])
-        if not raw or len(raw.split()) < 100:
-            continue
-        all_chunks.extend(chunk_text(raw, doc["url"], doc["title"]))
-    if not all_chunks:
-        raise RuntimeError("No chunks ingested from sources (all empty/blocked).")
-    vectors = embed_texts([c["text"] for c in all_chunks], embedder)
-    index = build_faiss(vectors)
-    side = {"chunks": all_chunks, "vectors_shape": vectors.shape}
-    return index, side
-
-def retrieve(query: str, index, side: Dict[str, Any], top_k: int = TOP_K) -> Tuple[List[Dict[str, Any]], float]:
-    embedder, reranker = load_embedder(), load_reranker()
-    qv = embed_texts([query], embedder)
-    scores, idxs = index.search(qv, K_CANDIDATES)
-    candidates = []
-    for rank, (ci, s) in enumerate(zip(idxs[0], scores[0]), start=1):
-        if ci < 0: continue
-        c = side["chunks"][ci]
-        candidates.append({"rank_ann":rank,"score_ann":float(s),**c})
-    if not candidates: return [], 0.0
-
-    try:
-        pairs = [(query, c["text"]) for c in candidates]
-        rers = reranker.predict(pairs, batch_size=64).tolist()
-        for c, rs in zip(candidates, rers): c["score_rerank"] = float(rs)
-    except Exception:
-        for c in candidates: c["score_rerank"] = float(c["score_ann"])
-
-    quality_results = [c for c in candidates if c["score_rerank"] >= MIN_RERANK_SCORE]
-    if not quality_results:
-        return [], 0.0
-
-    sorted_results = sorted(quality_results, key=lambda x: x["score_rerank"], reverse=True)[:top_k]
-    avg_score = sum(c["score_rerank"] for c in sorted_results) / len(sorted_results)
-    return sorted_results, avg_score
-
-# Lazy RAG
+# Lazy RAG (app-level singleton)
 _global_rag = {"index": None, "side": None}
 def ensure_rag_ready():
     if _global_rag["index"] is None or _global_rag["side"] is None:
@@ -436,7 +312,7 @@ def tool_rag_retrieve(inp: Any) -> Dict[str, Any]:
         k = int(data.get("top_k", TOP_K)); k = max(1, min(10, k))
     except:
         k = TOP_K
-    results, avg_score = retrieve(q, _global_rag["index"], _global_rag["side"], top_k=k)
+    results, avg_score = retrieve(q, _global_rag["index"], _global_rag["side"], top_k=k, min_score=MIN_RERANK_SCORE)
     if not results:
         return {"error": f"No relevant content in RAG corpus for: {q}",
                 "suggestion": "Topic may be outside corpus scope. Try web_search for broader coverage.",
@@ -967,6 +843,20 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"**Model:** {model_id.split('/')[-1]}")
     st.caption(f"**Scenario:** {scenario_name}")
+    with st.expander("About this version"):
+        st.write(
+            "Version 4 (Agentic). An autonomous planner selects tools (RAG, web "
+            "search, URL reader), reflects on progress, and synthesizes a "
+            "citation-grounded answer. Every step is traced and shown in the app."
+        )
+
+# Status bar under the header
+status_bar([
+    (f"Model: <b>{model_id.split('/')[-1]}</b>", ""),
+    (f"Scenario: <b>{scenario_name}</b>", ""),
+    ("Mode: Agentic", "mode"),
+    (("LangSmith: On", "ok") if _LS_ENABLED else ("LangSmith: Off", "")),
+])
 
 # =========================
 # Main Chat Interface
@@ -998,6 +888,11 @@ for msg in st.session_state.messages:
 
 # Chat input
 user_query = st.chat_input("Ask about Gen-AI, prompt engineering, ethics, or current AI news...")
+
+# Example-question buttons (below) set a pending query; pick it up here so it runs
+# through the same agent path as typed input.
+if not user_query and st.session_state.get("pending_query"):
+    user_query = st.session_state.pop("pending_query")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
@@ -1084,22 +979,23 @@ example_cols = st.columns(3)
 with example_cols[0]:
     st.markdown("**📚 Conceptual (uses RAG)**")
     if st.button("What is prompt engineering?", use_container_width=True):
-        st.session_state.messages.append({"role": "user", "content": "What is prompt engineering and what are the key techniques?"})
+        st.session_state.pending_query = "What is prompt engineering and what are the key techniques?"
         st.rerun()
 with example_cols[1]:
     st.markdown("**🌐 Current Info (uses Web)**")
     if st.button("Latest multimodal model updates?", use_container_width=True):
-        st.session_state.messages.append({"role": "user", "content": "What are the latest multimodal model updates?"})
+        st.session_state.pending_query = "What are the latest multimodal model updates?"
         st.rerun()
 with example_cols[2]:
     st.markdown("**🔀 Hybrid (uses both)**")
     if st.button("AI in education ethics", use_container_width=True):
-        st.session_state.messages.append({"role": "user", "content": "What are the ethical considerations of using AI in education?"})
+        st.session_state.pending_query = "What are the ethical considerations of using AI in education?"
         st.rerun()
 
 # =========================
 # Footer
 # =========================
-st.markdown("---")
-st.caption("⚠️ **Educational Use Only** • Verify critical information • Follow your organization's AI policies")
-st.caption(f"🔧 Powered by: {model_id} | LangSmith tracing enabled | RAG + Web Search + Agentic Planning")
+footer(
+    "Educational use only. Verify critical information and follow your organization's AI policies. "
+    f"Powered by {model_id.split('/')[-1]} with RAG, web search, and agentic planning."
+)
